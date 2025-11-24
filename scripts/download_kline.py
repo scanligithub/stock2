@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 # 配置
 OUTPUT_DIR = "temp_kline"
-START_DATE = "1990-01-01" # 下载全量历史
+START_DATE = "2024-01-01" # 下载全量历史
 # 获取环境变量中的任务索引，默认为 0
 TASK_INDEX = int(os.getenv("TASK_INDEX", 0))
 
