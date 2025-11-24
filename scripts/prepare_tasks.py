@@ -1,58 +1,78 @@
+# scripts/prepare_tasks.py
 import baostock as bs
-import pandas as pd
 import json
+import random
 import os
-import math
+from datetime import datetime, timedelta
+import pandas as pd
 
-TASK_COUNT = 20  # 并行任务数
-OUTPUT_DIR = "tasks"
-META_DIR = "meta_data"
+# 配置
+TASK_COUNT = 20
+OUTPUT_DIR = "task_slices"
+META_DIR = "meta_data"  # 新增：用于存放 stock_list.json 给前端用
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(META_DIR, exist_ok=True)
 
+def get_recent_trade_day():
+    """获取最近的一个交易日"""
+    for i in range(0, 10): # 尝试过去10天
+        day = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
+        rs = bs.query_trade_dates(start_date=day, end_date=day)
+        if rs.error_code == '0' and rs.next() and rs.get_row_data()[1] == '1':
+            print(f"最近交易日: {day}")
+            return day
+    raise Exception("未找到最近的交易日")
+
 def main():
-    print("正在登录 Baostock...")
-    bs.login()
+    print("开始获取股票列表...")
+    lg = bs.login()
+    if lg.error_code != '0':
+        raise Exception(f"登录失败: {lg.error_msg}")
 
-    # 1. 获取全市场股票
-    # 注意：这里取最近一个交易日可能不准，直接取当天的，如果没有则取昨天的
-    # Baostock query_all_stock 不需要特定日期，它返回的是当前最新的列表
-    rs = bs.query_all_stock(day=pd.Timestamp.now().strftime('%Y-%m-%d'))
-    
-    data_list = []
-    while rs.next():
-        data_list.append(rs.get_row_data())
-    
-    bs.logout()
+    try:
+        trade_day = get_recent_trade_day()
+        rs = bs.query_all_stock(day=trade_day)
+        
+        data_list = []
+        while rs.next():
+            data_list.append(rs.get_row_data())
+        
+        stock_df = pd.DataFrame(data_list, columns=rs.fields)
 
-    df = pd.DataFrame(data_list, columns=rs.fields)
-    
-    # 2. 过滤：只保留 股票 (排除指数等，Baostock type=1 是股票)
-    # 也可以通过 code 前缀过滤: sh.6, sz.0, sz.3, bj.4, bj.8
-    # 简单过滤：剔除空的 tradeStatus
-    df = df[df['code'] != '']
-    
-    # 3. 生成前端用的精简列表 (stock_list.json)
-    # 包含：code, name. 前端搜索用
-    stock_list_frontend = df[['code', 'code_name']].rename(columns={'code_name': 'name'}).to_dict(orient='records')
-    
-    meta_path = os.path.join(META_DIR, "stock_list.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(stock_list_frontend, f, ensure_ascii=False)
-    print(f"✅ 生成元数据: {meta_path} (共 {len(stock_list_frontend)} 只股票)")
+        stock_list = []
+        for _, row in stock_df.iterrows():
+            code, name = row['code'], row['code_name']
+            # 过滤逻辑：只保留沪深京A股，排除ST和退市
+            if code.startswith(('sh.', 'sz.', 'bj.')) and 'ST' not in name and '退' not in name:
+                stock_list.append({'code': code, 'name': name})
 
-    # 4. 生成并行任务分片
-    stocks = df[['code', 'code_name']].to_dict(orient='records')
-    total = len(stocks)
-    chunk_size = math.ceil(total / TASK_COUNT)
-    
-    for i in range(TASK_COUNT):
-        subset = stocks[i * chunk_size : (i + 1) * chunk_size]
-        task_path = os.path.join(OUTPUT_DIR, f"task_{i}.json")
-        with open(task_path, "w") as f:
-            json.dump(subset, f)
-    
-    print(f"✅ 任务分片完成: 生成 {TASK_COUNT} 个文件")
+        print(f"获取到 {len(stock_list)} 只有效股票")
+        
+        # --- 生成前端用的 stock_list.json ---
+        # 包含 code 和 name，用于前端搜索
+        meta_path = os.path.join(META_DIR, "stock_list.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(stock_list, f, ensure_ascii=False)
+        print(f"✅ 前端元数据已生成: {meta_path}")
+        # -----------------------------------
+
+        # 打乱顺序，实现负载均衡
+        random.shuffle(stock_list)
+        
+        # 分片生成
+        chunk_size = (len(stock_list) + TASK_COUNT - 1) // TASK_COUNT
+
+        for i in range(TASK_COUNT):
+            subset = stock_list[i * chunk_size: (i + 1) * chunk_size]
+            path = os.path.join(OUTPUT_DIR, f"task_slice_{i}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(subset, f, ensure_ascii=False, indent=2)
+
+        print(f"成功生成 {TASK_COUNT} 个任务分片，保存在 {OUTPUT_DIR}/")
+
+    finally:
+        bs.logout()
 
 if __name__ == "__main__":
     main()
