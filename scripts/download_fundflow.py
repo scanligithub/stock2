@@ -56,7 +56,6 @@ def main():
     
     # 如果文件不存在（可能任务数少于分片数），直接跳过
     if not os.path.exists(task_file): 
-        print(f"分片文件不存在: {task_file}，本任务跳过。")
         return
 
     with open(task_file, 'r', encoding='utf-8') as f:
@@ -67,21 +66,10 @@ def main():
             df = get_sina_flow(s['code'])
             if not df.empty:
                 df['code'] = s['code'] 
-                
-                # 1. 保存 Parquet (给后续程序用)
                 df.to_parquet(f"{OUTPUT_DIR}/{s['code']}.parquet", index=False)
-                
-                # 2. 【新增】保存 CSV (给你验证用)
-                # encoding='utf-8-sig' 确保 Excel 打开中文不乱码(虽然这里主要是数字)
-                df.to_csv(f"{OUTPUT_DIR}/{s['code']}.csv", index=False, encoding='utf-8-sig')
-                
-                # 3. 【新增】打印日志，直接在网页看结果
-                print(f"✅ Downloaded {s['code']}: {len(df)} rows")
-            else:
-                print(f"⚠️ Empty data for {s['code']}")
-
         except Exception as e:
-            print(f"❌ Error {s['code']}: {e}")
+            # 生产环境只打印错误，忽略正常的空数据
+            print(f"Error {s['code']}: {e}")
         
         # 随机延迟，防止封IP
         time.sleep(random.uniform(0.1, 0.25)) 
