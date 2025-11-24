@@ -15,13 +15,10 @@ HEADERS = {
 
 def get_sector_list():
     """
-    获取全量板块列表 (行业+概念+地域)
+    获取全量板块列表
     """
     sectors = []
-    # m:90 t:2 (行业板块)
-    # m:90 t:3 (概念板块)
-    # m:90 t:1 (地域板块)
-    # 去掉了 f:!50 过滤，确保获取所有静态存在的板块
+    # 移除 f:!50 过滤，确保获取全量
     board_types = {
         "行业": "m:90 t:2",
         "概念": "m:90 t:3",
@@ -42,7 +39,6 @@ def get_sector_list():
             if res and res.get('data') and res['data'].get('diff'):
                 data = res['data']['diff']
                 print(f"  -> 发现 {len(data)} 个 {name} 板块")
-                # 标记一下板块类型，方便后续分析
                 for item in data:
                     item['type'] = name
                 sectors.extend(data)
@@ -50,16 +46,20 @@ def get_sector_list():
             print(f"List Error ({name}): {e}")
             
     df = pd.DataFrame(sectors)
+    # 重命名列
     return df.rename(columns={'f12': 'code', 'f14': 'name'})
 
 def get_history(code):
     """
-    一次性获取历史数据 (1990-2050)
-    东财板块通常使用 '90.' 前缀
+    一次性获取历史数据
+    关键修复：代码前必须加 BK
     """
-    # 东财板块 ID 主要是 90.BKxxxx
-    # 偶尔也有其他情况，这里优先试 90.
-    secid = f"90.{code}"
+    # 【核心修复】
+    # 列表返回的是 "0425"，接口需要的是 "90.BK0425"
+    if not str(code).startswith('BK'):
+        secid = f"90.BK{code}"
+    else:
+        secid = f"90.{code}"
     
     url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
     params = {
@@ -72,16 +72,12 @@ def get_history(code):
     try:
         res = requests.get(url, params=params, headers=HEADERS, timeout=5).json()
         
-        # 如果 90. 没数据，且代码不是 BK 开头，可能需要尝试其他组合（极少见，暂忽略）
-        # 大部分板块都是 BK 开头，走 90. 没问题
-        
         if res and res.get('data') and res['data'].get('klines'):
             klines = res['data']['klines']
             data = [x.split(',') for x in klines]
             df = pd.DataFrame(data, columns=['date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'turnover'])
-            df['code'] = code
+            df['code'] = code # 这里保留原始代码(如0425)，不带BK，方便后续映射
             
-            # 转数值
             cols = ['open', 'close', 'high', 'low', 'volume', 'amount', 'turnover']
             df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
             return df
@@ -94,37 +90,40 @@ def main():
     print("Step 1: 下载全量板块列表...")
     df_list = get_sector_list()
     
-    # 去重（有的板块可能既算概念又算行业）
+    # 去重
     df_list.drop_duplicates(subset=['code'], inplace=True)
-    print(f"去重后共 {len(df_list)} 个唯一板块")
+    print(f"去重后待下载板块总数: {len(df_list)} 个")
     
-    # 保存板块映射表 (包含 name, code, type)
+    # 保存板块列表
     df_list.to_parquet(f"{OUTPUT_DIR}/sector_list.parquet", index=False)
     
     print(f"Step 2: 并发下载历史数据...")
     all_dfs = []
     
     total = len(df_list)
+    success_count = 0
+    
     for idx, row in df_list.iterrows():
         df = get_history(row['code'])
         
         if not df.empty:
             all_dfs.append(df)
+            success_count += 1
         
         if idx % 50 == 0: 
-            print(f"  Processed {idx}/{total}: {row['name']}")
+            print(f"  Processed {idx}/{total} - Success: {success_count}")
         
-        # 极速延迟 (板块数据在东财属于极低频访问，0.05秒通常没问题)
         time.sleep(random.uniform(0.05, 0.1))
         
     if all_dfs:
+        print("正在合并板块宽表...")
         full_df = pd.concat(all_dfs, ignore_index=True)
         full_df.sort_values(['code', 'date'], inplace=True)
         
         outfile = f"{OUTPUT_DIR}/sector_full.parquet"
         full_df.to_parquet(outfile, index=False, compression='zstd')
         print(f"✅ 板块宽表生成完毕: {outfile}")
-        print(f"   包含板块数: {full_df['code'].nunique()}")
+        print(f"   最终有效板块数: {full_df['code'].nunique()}")
         print(f"   总记录数: {len(full_df)}")
     else:
         print("❌ 未下载到任何板块数据")
