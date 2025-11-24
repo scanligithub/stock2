@@ -1,0 +1,158 @@
+name: A-Share Daily ETL Pipeline
+
+on:
+  schedule:
+    # 北京时间 21:00 (UTC 13:00)
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+
+jobs:
+  # === Job 1: 准备任务 ===
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -r requirements.txt
+      - name: Generate Tasks
+        run: python scripts/prepare_tasks.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tasks
+          path: tasks/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meta_data
+          path: meta_data/
+
+  # === Job 2: 并行下载 K线 (含 PE/PB) ===
+  download-kline:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        task_index: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+      max-parallel: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tasks
+          path: tasks/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -r requirements.txt
+      - name: Download KLine
+        env:
+          TASK_INDEX: ${{ matrix.task_index }}
+        run: python scripts/download_kline.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kline_part_${{ matrix.task_index }}
+          path: temp_kline/
+
+  # === Job 3: 并行下载 资金流 ===
+  download-fundflow:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        task_index: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+      max-parallel: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tasks
+          path: tasks/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -r requirements.txt
+      - name: Download FundFlow
+        env:
+          TASK_INDEX: ${{ matrix.task_index }}
+        run: python scripts/download_fundflow.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flow_part_${{ matrix.task_index }}
+          path: temp_fundflow/
+
+  # === Job 4: 下载/更新 板块数据 (单任务即可) ===
+  process-sector:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -r requirements.txt
+      - name: Download Sector Data
+        run: python scripts/download_sector.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sector_data
+          path: final_output/engine/
+
+  # === Job 5: 合并 & 上传 OSS (Finalize) ===
+  finalize:
+    needs: [download-kline, download-fundflow, process-sector, prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      # 1. 下载所有中间产物
+      - uses: actions/download-artifact@v4
+        with:
+          path: all_artifacts
+          
+      - name: Organize Artifacts
+        run: |
+          mkdir -p downloaded_kline downloaded_fundflow final_output/engine final_output/meta
+          
+          # 移动 K线分片
+          find all_artifacts -name "kline_part_*" -exec cp -r {}/. downloaded_kline/ \;
+          # 移动 资金流分片
+          find all_artifacts -name "flow_part_*" -exec cp -r {}/. downloaded_fundflow/ \;
+          # 移动 板块数据
+          cp -r all_artifacts/sector_data/* final_output/engine/ 2>/dev/null || true
+          # 移动 元数据 (stock_list.json)
+          cp all_artifacts/meta_data/stock_list.json final_output/meta/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -r requirements.txt
+      
+      # 2. 执行宽表合并 (生成 stock_full.parquet)
+      - name: Merge Wide Table
+        run: python scripts/merge_data.py
+
+      # 3. 配置 ossutil
+      - name: Setup ossutil
+        uses: manyuanrong/setup-ossutil@v2.0
+        with:
+          endpoint: ${{ secrets.OSS_ENDPOINT }}
+          access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+
+      # 4. 上传到阿里云 OSS (核心步骤)
+      - name: Upload to OSS
+        run: |
+          echo "Uploading Metadata..."
+          ossutil cp -f final_output/meta/stock_list.json oss://${{ secrets.OSS_BUCKET }}/meta/stock_list.json
+          
+          echo "Uploading Engine Data..."
+          # 上传个股宽表 (大文件，开启并发)
+          ossutil cp -f final_output/engine/stock_full.parquet oss://${{ secrets.OSS_BUCKET }}/engine/stock_full.parquet --jobs=10 --part-size=10240000
+          
+          # 上传板块宽表
+          ossutil cp -f final_output/engine/sector_full.parquet oss://${{ secrets.OSS_BUCKET }}/engine/sector_full.parquet
+          
+          # 上传板块列表
+          ossutil cp -f final_output/sector_list.parquet oss://${{ secrets.OSS_BUCKET }}/engine/sector_list.parquet || true
+
+          echo "✅ All Data Uploaded!"
