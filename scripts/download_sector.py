@@ -12,24 +12,25 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "http://quote.eastmoney.com/"
+    "Referer": "http://quote.eastmoney.com/",
+    "Connection": "close"  # 【关键修改】主动关闭长连接，防止 RemoteDisconnected
 }
 
 def create_session():
-    """创建一个带重试机制的 Session"""
+    """创建一个高可用的 Session"""
     session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    # 增加重试次数到 5 次，增加 backoff_factor (重试间隔时间)
+    retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504, 104])
     session.mount('http://', HTTPAdapter(max_retries=retries))
     session.mount('https://', HTTPAdapter(max_retries=retries))
+    session.headers.update(HEADERS)
     return session
 
 # 全局 session
 sess = create_session()
 
 def get_sector_list_by_type(name, fs):
-    """
-    自动翻页获取某一类板块
-    """
+    """自动翻页获取板块列表"""
     sectors = []
     page = 1
     page_size = 100
@@ -38,7 +39,6 @@ def get_sector_list_by_type(name, fs):
     
     while True:
         url = "http://17.push2.eastmoney.com/api/qt/clist/get"
-        # f13 是市场代码 (Market Code)，非常重要！
         params = {
             "pn": page, "pz": page_size, "po": 1, "np": 1, 
             "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -46,8 +46,7 @@ def get_sector_list_by_type(name, fs):
             "fields": "f12,f13,f14" 
         }
         try:
-            # 使用 session 发送请求，自带重试
-            res = sess.get(url, params=params, headers=HEADERS, timeout=10).json()
+            res = sess.get(url, params=params, timeout=15).json()
             if res and res.get('data') and res['data'].get('diff'):
                 data = res['data']['diff']
                 for item in data:
@@ -57,6 +56,7 @@ def get_sector_list_by_type(name, fs):
                 if len(data) < page_size:
                     break
                 page += 1
+                time.sleep(0.5) # 翻页稍微停顿一下
             else:
                 break
         except Exception as e:
@@ -79,20 +79,16 @@ def get_sector_list():
         all_sectors.extend(data)
         
     df = pd.DataFrame(all_sectors)
-    # f12=code, f13=market, f14=name
+    # 可能有些板块获取失败导致为空，做个判断
+    if df.empty:
+        return pd.DataFrame(columns=['code', 'market', 'name'])
     return df.rename(columns={'f12': 'code', 'f13': 'market', 'f14': 'name'})
 
 def get_history(code, market):
-    """
-    获取历史数据
-    使用 market(f13) 来构建精准的 secid
-    """
-    # 构造 secid
-    # 东财逻辑：
-    # 如果 market 是 90，通常需要加 BK 前缀 (如 90.BK0425)
-    # 除非代码本身已经包含了 BK (极少见)
+    """获取历史数据"""
     clean_code = str(code)
     
+    # 构造 secid
     if str(market) == '90' and not clean_code.startswith('BK'):
         secid = f"{market}.BK{clean_code}"
     else:
@@ -107,28 +103,24 @@ def get_history(code, market):
     }
     
     try:
-        res = sess.get(url, params=params, headers=HEADERS, timeout=10).json()
+        # timeout 增加到 15秒
+        res = sess.get(url, params=params, timeout=15).json()
         
         if res and res.get('data') and res['data'].get('klines'):
             klines = res['data']['klines']
             data = [x.split(',') for x in klines]
             df = pd.DataFrame(data, columns=['date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'turnover'])
-            
-            # 统一使用原始代码（方便映射）
             df['code'] = clean_code
-            
             cols = ['open', 'close', 'high', 'low', 'volume', 'amount', 'turnover']
             df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
             return df
         else:
-            # 只有当数据为空时，尝试一下备用方案（不加BK）
-            # 这作为一种防御性编程
+            # 备用方案重试
             if ".BK" in secid:
                 alt_secid = secid.replace(".BK", ".")
                 params['secid'] = alt_secid
-                res_alt = sess.get(url, params=params, headers=HEADERS, timeout=5).json()
+                res_alt = sess.get(url, params=params, timeout=15).json()
                 if res_alt and res_alt.get('data') and res_alt['data'].get('klines'):
-                     # print(f"  ⚠️ Fixed {code} using {alt_secid}")
                      klines = res_alt['data']['klines']
                      data = [x.split(',') for x in klines]
                      df = pd.DataFrame(data, columns=['date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'turnover'])
@@ -138,20 +130,22 @@ def get_history(code, market):
                      return df
 
     except Exception as e:
-        print(f"Error {code}: {e}")
+        # 此时的 error 通常是重试多次后依然失败
+        print(f"Failed {code}: {e}")
     
     return pd.DataFrame()
 
 def main():
-    print("Step 1: 扫描全市场板块 (带重试)...")
+    print("Step 1: 扫描全市场板块 (稳健模式)...")
     df_list = get_sector_list()
     
-    # 去重
+    if df_list.empty:
+        print("❌ 列表获取失败，退出。")
+        return
+
     df_list.drop_duplicates(subset=['code'], inplace=True)
-    
     print(f"✅ 去重后待下载板块总数: {len(df_list)} 个")
     
-    # 保存列表
     df_list.to_parquet(f"{OUTPUT_DIR}/sector_list.parquet", index=False)
     
     print(f"Step 2: 开始下载历史数据...")
@@ -166,15 +160,12 @@ def main():
         if not df.empty:
             all_dfs.append(df)
             success_count += 1
-        else:
-            # 只有失败才打印，方便调试
-            # print(f"❌ Failed: {row['name']} ({row['code']})")
-            pass
         
         if idx % 50 == 0:
             print(f"  进度: {idx}/{total} | 成功: {success_count}")
-            
-        time.sleep(random.uniform(0.05, 0.1))
+        
+        # 【关键】增加延迟到 0.2 - 0.4 秒，宁慢勿挂
+        time.sleep(random.uniform(0.2, 0.4))
         
     if all_dfs:
         print("正在合并...")
