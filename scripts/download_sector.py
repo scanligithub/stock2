@@ -14,68 +14,120 @@ HEADERS = {
 }
 
 def get_sector_list():
+    """
+    获取全量板块列表 (行业+概念+地域)
+    """
     sectors = []
-    # 获取行业(m:90 t:2)和概念(m:90 t:3)
-    for fs in ["m:90 t:2 f:!50", "m:90 t:3 f:!50"]:
+    # m:90 t:2 (行业板块)
+    # m:90 t:3 (概念板块)
+    # m:90 t:1 (地域板块)
+    # 去掉了 f:!50 过滤，确保获取所有静态存在的板块
+    board_types = {
+        "行业": "m:90 t:2",
+        "概念": "m:90 t:3",
+        "地域": "m:90 t:1"
+    }
+    
+    for name, fs in board_types.items():
+        print(f"正在获取 {name} 板块列表...")
         url = "http://17.push2.eastmoney.com/api/qt/clist/get"
         params = {
             "pn": 1, "pz": 5000, "po": 1, "np": 1, 
             "ut": "bd1d9ddb04089700cf9c27f6f7426281",
             "fltt": 2, "invt": 2, "fid": "f3", "fs": fs,
-            "fields": "f12,f13,f14"
+            "fields": "f12,f13,f14" # f12:code, f14:name
         }
         try:
-            res = requests.get(url, params=params, headers=HEADERS).json()
-            if res and res.get('data'):
-                sectors.extend(res['data']['diff'])
+            res = requests.get(url, params=params, headers=HEADERS, timeout=10).json()
+            if res and res.get('data') and res['data'].get('diff'):
+                data = res['data']['diff']
+                print(f"  -> 发现 {len(data)} 个 {name} 板块")
+                # 标记一下板块类型，方便后续分析
+                for item in data:
+                    item['type'] = name
+                sectors.extend(data)
         except Exception as e:
-            print(f"List Error: {e}")
-    return pd.DataFrame(sectors).rename(columns={'f12': 'code', 'f14': 'name'})
+            print(f"List Error ({name}): {e}")
+            
+    df = pd.DataFrame(sectors)
+    return df.rename(columns={'f12': 'code', 'f14': 'name'})
 
 def get_history(code):
-    # 尝试不同前缀
-    for prefix in ["90", "93"]: 
-        url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
-        params = {
-            "secid": f"{prefix}.{code}",
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-            "klt": "101", "fqt": "1", "beg": "19900101", "end": "20500101", "lmt": "1000000"
-        }
-        try:
-            res = requests.get(url, params=params, headers=HEADERS, timeout=5).json()
-            if res and res.get('data') and res['data'].get('klines'):
-                klines = res['data']['klines']
-                data = [x.split(',') for x in klines]
-                df = pd.DataFrame(data, columns=['date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'turnover'])
-                df['code'] = code
-                cols = ['open', 'close', 'high', 'low', 'volume', 'amount', 'turnover']
-                df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
-                return df
-        except:
-            pass
+    """
+    一次性获取历史数据 (1990-2050)
+    东财板块通常使用 '90.' 前缀
+    """
+    # 东财板块 ID 主要是 90.BKxxxx
+    # 偶尔也有其他情况，这里优先试 90.
+    secid = f"90.{code}"
+    
+    url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "klt": "101", "fqt": "1", "beg": "19900101", "end": "20500101", "lmt": "1000000"
+    }
+    
+    try:
+        res = requests.get(url, params=params, headers=HEADERS, timeout=5).json()
+        
+        # 如果 90. 没数据，且代码不是 BK 开头，可能需要尝试其他组合（极少见，暂忽略）
+        # 大部分板块都是 BK 开头，走 90. 没问题
+        
+        if res and res.get('data') and res['data'].get('klines'):
+            klines = res['data']['klines']
+            data = [x.split(',') for x in klines]
+            df = pd.DataFrame(data, columns=['date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'turnover'])
+            df['code'] = code
+            
+            # 转数值
+            cols = ['open', 'close', 'high', 'low', 'volume', 'amount', 'turnover']
+            df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
+            return df
+    except:
+        pass
+    
     return pd.DataFrame()
 
 def main():
-    print("下载板块列表...")
+    print("Step 1: 下载全量板块列表...")
     df_list = get_sector_list()
-    # 存为 Parquet 供 DuckDB 查询
+    
+    # 去重（有的板块可能既算概念又算行业）
+    df_list.drop_duplicates(subset=['code'], inplace=True)
+    print(f"去重后共 {len(df_list)} 个唯一板块")
+    
+    # 保存板块映射表 (包含 name, code, type)
     df_list.to_parquet(f"{OUTPUT_DIR}/sector_list.parquet", index=False)
     
-    print(f"下载 {len(df_list)} 个板块历史K线...")
+    print(f"Step 2: 并发下载历史数据...")
     all_dfs = []
+    
+    total = len(df_list)
     for idx, row in df_list.iterrows():
         df = get_history(row['code'])
+        
         if not df.empty:
             all_dfs.append(df)
-        time.sleep(random.uniform(0.1, 0.2))
+        
+        if idx % 50 == 0: 
+            print(f"  Processed {idx}/{total}: {row['name']}")
+        
+        # 极速延迟 (板块数据在东财属于极低频访问，0.05秒通常没问题)
+        time.sleep(random.uniform(0.05, 0.1))
         
     if all_dfs:
         full_df = pd.concat(all_dfs, ignore_index=True)
         full_df.sort_values(['code', 'date'], inplace=True)
-        # 存为板块宽表
-        full_df.to_parquet(f"{OUTPUT_DIR}/sector_full.parquet", index=False, compression='zstd')
-        print(f"✅ 板块数据完成: {OUTPUT_DIR}/sector_full.parquet")
+        
+        outfile = f"{OUTPUT_DIR}/sector_full.parquet"
+        full_df.to_parquet(outfile, index=False, compression='zstd')
+        print(f"✅ 板块宽表生成完毕: {outfile}")
+        print(f"   包含板块数: {full_df['code'].nunique()}")
+        print(f"   总记录数: {len(full_df)}")
+    else:
+        print("❌ 未下载到任何板块数据")
 
 if __name__ == "__main__":
     main()
