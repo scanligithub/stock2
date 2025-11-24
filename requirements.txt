@@ -1,0 +1,5 @@
+pandas
+baostock
+requests
+pyarrow
+tqdm
