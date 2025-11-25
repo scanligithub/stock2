@@ -9,28 +9,28 @@ import sys
 OUTPUT_DIR = "final_output/engine"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 从环境变量获取 Cloudflare Worker 地址
-# 格式如: https://xxx.xxx.workers.dev
+# 尝试获取 Cloudflare Worker 环境变量
 CF_WORKER_URL = os.getenv("CF_WORKER_URL")
 
-if not CF_WORKER_URL:
-    print("❌ 错误: 未设置 CF_WORKER_URL 环境变量！")
-    # 为了防止你本地运行报错，这里可以写死一个方便调试，但在 GitHub 上必须用 Secrets
-    # CF_WORKER_URL = "https://你的worker地址" 
-    sys.exit(1)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "http://quote.eastmoney.com/",
+    "Connection": "close"
+}
 
-def get_sector_list_by_type(name, fs):
-    """通过 CF Worker 获取板块列表"""
+def get_sector_list_raw(name, fs):
+    """获取原始列表"""
     sectors = []
     page = 1
-    page_size = 100 # Worker 速度快，可以尝试大一点，但东财限制单页100
+    page_size = 100
+    
+    # 如果有 CF Worker，走 Worker
+    base_url = "http://17.push2.eastmoney.com/api/qt/clist/get"
     
     print(f"正在获取 {name} 列表...", end="", flush=True)
     
     while True:
-        # 请求 Worker，带上 target_func=list
         params = {
-            "target_func": "list",  # 告诉 Worker 我们要访问列表接口
             "pn": page, "pz": page_size, "po": 1, "np": 1, 
             "ut": "bd1d9ddb04089700cf9c27f6f7426281",
             "fltt": 2, "invt": 2, "fid": "f3", "fs": fs,
@@ -38,55 +38,49 @@ def get_sector_list_by_type(name, fs):
         }
         
         try:
-            # 直接请求 Worker，不需要复杂的 Headers，Worker 会帮我们加
-            res = requests.get(CF_WORKER_URL, params=params, timeout=20).json()
-            
+            if CF_WORKER_URL:
+                params["target_func"] = "list"
+                res = requests.get(CF_WORKER_URL, params=params, timeout=20).json()
+            else:
+                res = requests.get(base_url, params=params, headers=HEADERS, timeout=10).json()
+
             if res and res.get('data') and res['data'].get('diff'):
                 data = res['data']['diff']
                 for item in data:
                     item['type'] = name
                 sectors.extend(data)
-                
-                if len(data) < page_size:
-                    break
+                if len(data) < page_size: break
                 page += 1
+                if not CF_WORKER_URL: time.sleep(0.5)
             else:
                 break
         except Exception as e:
-            print(f"\n❌ Error fetching {name} page {page}: {e}")
+            print(f" [Err: {e}] ", end="")
             break
             
-    print(f" -> 共 {len(sectors)} 个")
+    print(f" -> {len(sectors)} 个")
     return sectors
 
 def get_sector_list():
     all_sectors = []
-    targets = {
-        "行业": "m:90 t:2",
-        "概念": "m:90 t:3",
-        "地域": "m:90 t:1"
-    }
+    targets = {"行业": "m:90 t:2", "概念": "m:90 t:3", "地域": "m:90 t:1"}
     for name, fs in targets.items():
-        data = get_sector_list_by_type(name, fs)
+        data = get_sector_list_raw(name, fs)
         all_sectors.extend(data)
-        
+    
     df = pd.DataFrame(all_sectors)
     if df.empty: return pd.DataFrame()
     return df.rename(columns={'f12': 'code', 'f13': 'market', 'f14': 'name'})
 
 def get_history(code, market):
-    """通过 CF Worker 获取历史 K 线"""
     clean_code = str(code)
-    
     # 构造 secid
     if str(market) == '90' and not clean_code.startswith('BK'):
         secid = f"{market}.BK{clean_code}"
     else:
         secid = f"{market}.{clean_code}"
 
-    # 构造 Worker 请求参数
     params = {
-        "target_func": "kline", # 告诉 Worker 我们要访问K线接口
         "secid": secid,
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
@@ -94,8 +88,14 @@ def get_history(code, market):
     }
     
     try:
-        res = requests.get(CF_WORKER_URL, params=params, timeout=20).json()
+        if CF_WORKER_URL:
+            params["target_func"] = "kline"
+            res = requests.get(CF_WORKER_URL, params=params, timeout=20).json()
+        else:
+            base_url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+            res = requests.get(base_url, params=params, headers=HEADERS, timeout=10).json()
         
+        # 成功拿到数据
         if res and res.get('data') and res['data'].get('klines'):
             klines = res['data']['klines']
             data = [x.split(',') for x in klines]
@@ -104,72 +104,97 @@ def get_history(code, market):
             cols = ['open', 'close', 'high', 'low', 'volume', 'amount', 'turnover']
             df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
             return df
-        else:
-            # 备用方案（处理 BK 前缀问题）
-            if ".BK" in secid:
-                params['secid'] = secid.replace(".BK", ".")
+        
+        # 备用方案 (处理 BK 前缀)
+        if ".BK" in secid:
+            params['secid'] = secid.replace(".BK", ".")
+            if CF_WORKER_URL:
                 res_alt = requests.get(CF_WORKER_URL, params=params, timeout=20).json()
-                if res_alt and res_alt.get('data') and res_alt['data'].get('klines'):
-                     klines = res_alt['data']['klines']
-                     data = [x.split(',') for x in klines]
-                     df = pd.DataFrame(data, columns=['date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'turnover'])
-                     df['code'] = clean_code
-                     cols = ['open', 'close', 'high', 'low', 'volume', 'amount', 'turnover']
-                     df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
-                     return df
+            else:
+                res_alt = requests.get(base_url, params=params, headers=HEADERS, timeout=10).json()
+            
+            if res_alt and res_alt.get('data') and res_alt['data'].get('klines'):
+                klines = res_alt['data']['klines']
+                data = [x.split(',') for x in klines]
+                df = pd.DataFrame(data, columns=['date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'turnover'])
+                df['code'] = clean_code
+                cols = ['open', 'close', 'high', 'low', 'volume', 'amount', 'turnover']
+                df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
+                return df
 
-    except Exception as e:
-        # CF Worker 可能会返回 500 或 502，如果不打印具体错误很难排查
-        # print(f"Error {code}: {e}") 
+    except Exception:
         pass
     
     return pd.DataFrame()
 
 def main():
-    print(f"🚀 使用代理加速: {CF_WORKER_URL}")
-    print("Step 1: 扫描全市场板块...")
-    df_list = get_sector_list()
-    
-    if df_list.empty:
-        print("❌ 列表获取失败，可能是 Worker 配置错误或额度耗尽。")
-        return
+    if CF_WORKER_URL:
+        print(f"🚀 代理模式: {CF_WORKER_URL}")
+    else:
+        print("🐢 直连模式 (可能会慢/不稳定)")
 
+    # 1. 获取目标列表
+    print("Step 1: 获取全市场板块列表...")
+    df_list = get_sector_list()
+    if df_list.empty:
+        print("❌ 列表获取失败")
+        return
+        
     df_list.drop_duplicates(subset=['code'], inplace=True)
-    print(f"✅ 待下载板块总数: {len(df_list)} 个")
+    total_targets = len(df_list)
+    print(f"✅ 目标板块总数: {total_targets} 个")
     
     df_list.to_parquet(f"{OUTPUT_DIR}/sector_list.parquet", index=False)
     
-    print(f"Step 2: 并发下载历史数据...")
+    # 2. 循环补录机制
     all_dfs = []
-    total = len(df_list)
-    success_count = 0
+    downloaded_codes = set()
     
-    for idx, row in df_list.iterrows():
-        df = get_history(row['code'], row['market'])
+    # 最多尝试 3 轮
+    MAX_ROUNDS = 3
+    
+    for round_num in range(1, MAX_ROUNDS + 1):
+        # 找出本轮需要下载的 (总目标 - 已成功)
+        pending_df = df_list[~df_list['code'].isin(downloaded_codes)]
         
-        if not df.empty:
-            all_dfs.append(df)
-            success_count += 1
+        if pending_df.empty:
+            print("✨ 所有板块已全部下载完成！")
+            break
+            
+        print(f"\n🔄 第 {round_num}/{MAX_ROUNDS} 轮下载 (剩余 {len(pending_df)} 个)...")
         
-        if idx % 50 == 0:
-            print(f"  进度: {idx}/{total} | 成功: {success_count}")
-        
-        # Cloudflare 抗压能力极强，我们不需要 sleep 很久，0.05秒足够
-        # 甚至可以尝试 0 秒，但为了保险起见保留一点点
-        time.sleep(0.05)
-        
+        count = 0
+        for _, row in pending_df.iterrows():
+            df = get_history(row['code'], row['market'])
+            
+            if not df.empty:
+                all_dfs.append(df)
+                downloaded_codes.add(row['code'])
+            
+            count += 1
+            if count % 50 == 0:
+                print(f"   进度: {count}/{len(pending_df)} | 当前总成功: {len(downloaded_codes)}")
+            
+            # 延时策略
+            if not CF_WORKER_URL:
+                time.sleep(random.uniform(0.1, 0.3))
+            else:
+                time.sleep(0.02) # 代理模式可以很快
+    
+    # 3. 合并结果
+    print(f"\n📊 最终统计: 目标 {total_targets} -> 成功 {len(downloaded_codes)}")
+    
     if all_dfs:
-        print("正在合并...")
+        print("正在合并宽表...")
         full_df = pd.concat(all_dfs, ignore_index=True)
         full_df.sort_values(['code', 'date'], inplace=True)
         
         outfile = f"{OUTPUT_DIR}/sector_full.parquet"
         full_df.to_parquet(outfile, index=False, compression='zstd')
-        print(f"✅ 板块宽表生成完毕: {outfile}")
-        print(f"   最终有效板块数: {full_df['code'].nunique()}")
+        print(f"✅ 文件已生成: {outfile}")
         print(f"   总记录数: {len(full_df)}")
     else:
-        print("❌ 严重错误：未下载到任何板块数据！")
+        print("❌ 严重错误：所有轮次均未下载到数据！")
 
 if __name__ == "__main__":
     main()
