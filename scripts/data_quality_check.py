@@ -76,29 +76,23 @@ def check_stock_data():
     
     # --- 资金流向专属质检 ---
     ff_stats = {}
-    valid_ff_count = 0 # 有效资金流记录数
+    valid_ff_count = 0 
     
     if 'net_flow_amount' in df.columns:
-        # 1. 异常统计
         nan_count = df['net_flow_amount'].isnull().sum()
         zero_count = (df['net_flow_amount'] == 0).sum()
         anomaly_count = nan_count + zero_count
-        
-        # 2. 计算有效记录数
         valid_ff_count = total_rows - anomaly_count
         
-        # 3. 探测起始日期
         valid_ff_df = df[df['net_flow_amount'].notna() & (df['net_flow_amount'] != 0)]
         if not valid_ff_df.empty:
             ff_start_date = str(valid_ff_df['date'].min())
         else:
             ff_start_date = "无有效数据"
 
-        # 4. 评分逻辑
         anomaly_rate = anomaly_count / total_rows
         ff_score = max(0, 100 - int(anomaly_rate * 100))
         
-        # 5. 详细统计
         pos_flow = (df['net_flow_amount'] > 0).sum()
         neg_flow = (df['net_flow_amount'] < 0).sum()
         max_inflow = df['net_flow_amount'].max()
@@ -106,7 +100,7 @@ def check_stock_data():
         
         ff_stats = {
             "score": ff_score,
-            "valid_count": int(valid_ff_count), # 新增
+            "valid_count": int(valid_ff_count),
             "start_date": ff_start_date,
             "anomaly_count": int(anomaly_count),
             "details": {
@@ -117,7 +111,6 @@ def check_stock_data():
             }
         }
     
-    # --- 全局指标 ---
     missing_factor = df['adjustFactor'].isnull().sum() if 'adjustFactor' in df.columns else total_rows
     invalid_cap = (df['mkt_cap'] <= 0).sum() if 'mkt_cap' in df.columns else 0
     
@@ -128,7 +121,7 @@ def check_stock_data():
     return {
         "status": "Success",
         "global_score": global_score,
-        "total_rows": int(total_rows), # 这就是 K线记录数
+        "total_rows": int(total_rows),
         "stock_count": int(unique_stocks),
         "date_range": f"{min_date} ~ {max_date}",
         "other_metrics": {
@@ -169,22 +162,18 @@ def main():
         "sector_data": sector_res
     }
     
-    # JSON
     json_path = f"{REPORT_DIR}/quality_report.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
         
-    # Markdown
     md_path = f"{REPORT_DIR}/summary.md"
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(f"## 📊 数据质量报告 (Data Quality Report)\n")
         f.write(f"**生成时间**: {report['generate_time']} (UTC)\n\n")
         
-        # --- Stock Section ---
         s = report['stock_data']
         f.write(f"### 🚀 个股全量表 (Stock Full)\n")
         if s.get('status') == 'Success':
-            # 核心计数显示
             f.write(f"- **K线记录总数**: **{s['total_rows']:,}** 行 (基础行情完整)\n")
             
             ff = s.get('fund_flow_data', {})
@@ -199,8 +188,10 @@ def main():
                 score = ff['score']
                 icon = "🟢" if score >= 90 else ("🟡" if score >= 60 else "🔴")
                 
+                f.write(f"- **资金流健康评分**: {icon} **{score}** / 100\n")
                 f.write(f"- **资金流覆盖始于**: **{ff['start_date']}**\n")
-                f.write(f"- **K线日期范围**: {ff['date_range']}\n")
+                # 【修复点】这里使用 s['date_range'] 而不是 ff['date_range']
+                f.write(f"- **K线日期范围**: {s['date_range']}\n")
                 
                 anom = ff['anomaly_count']
                 f.write(f"- **空值/零值数**: ⚠️ {anom:,} (2010年前或停牌)\n")
@@ -221,7 +212,6 @@ def main():
         
         f.write("\n---\n")
         
-        # --- Sector Section ---
         sec = report['sector_data']
         f.write(f"### 🌍 板块全量表 (Sector Full)\n")
         if sec.get('status') == 'Success':
