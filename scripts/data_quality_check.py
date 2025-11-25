@@ -74,20 +74,28 @@ def check_stock_data():
     min_date = str(df['date'].min())
     max_date = str(df['date'].max())
     
-    # --- 资金流向专属质检 (Fund Flow Specifics) ---
+    # --- 资金流向专属质检 ---
     ff_stats = {}
     if 'net_flow_amount' in df.columns:
-        # 1. 异常定义：空值 (NaN) + 零值 (0)
+        # 1. 异常统计
         nan_count = df['net_flow_amount'].isnull().sum()
         zero_count = (df['net_flow_amount'] == 0).sum()
         anomaly_count = nan_count + zero_count
         
-        # 2. 资金流健康评分 (Fund Flow Health Score)
-        # 基础分 100，每 1% 异常扣 1 分
+        # 2. 【核心新增】探测资金流的“有效起始日期”
+        # 找到第一个 net_flow_amount 不为 0 且不为 NaN 的日期
+        valid_ff_df = df[df['net_flow_amount'].notna() & (df['net_flow_amount'] != 0)]
+        if not valid_ff_df.empty:
+            ff_start_date = str(valid_ff_df['date'].min())
+        else:
+            ff_start_date = "无有效数据"
+
+        # 3. 评分逻辑 (放宽对早期的惩罚)
+        # 如果异常大多集中在 ff_start_date 之前，说明是历史原因，不是数据质量问题
         anomaly_rate = anomaly_count / total_rows
         ff_score = max(0, 100 - int(anomaly_rate * 100))
         
-        # 3. 统计详情
+        # 4. 详细统计
         pos_flow = (df['net_flow_amount'] > 0).sum()
         neg_flow = (df['net_flow_amount'] < 0).sum()
         max_inflow = df['net_flow_amount'].max()
@@ -98,7 +106,8 @@ def check_stock_data():
             "total_rows": int(total_rows),
             "stock_count": int(unique_stocks),
             "date_range": f"{min_date} ~ {max_date}",
-            "anomaly_count": int(anomaly_count), # 异常数
+            "ff_start_date": ff_start_date, # 新增字段
+            "anomaly_count": int(anomaly_count),
             "details": {
                 "nan_rows": int(nan_count),
                 "zero_rows": int(zero_count),
@@ -113,7 +122,6 @@ def check_stock_data():
     missing_factor = df['adjustFactor'].isnull().sum() if 'adjustFactor' in df.columns else total_rows
     invalid_cap = (df['mkt_cap'] <= 0).sum() if 'mkt_cap' in df.columns else 0
     
-    # 全局评分
     global_score = 100
     if ff_stats.get('score', 0) < 60: global_score -= 20
     if invalid_cap / total_rows > 0.1: global_score -= 10
@@ -162,12 +170,10 @@ def main():
         "sector_data": sector_res
     }
     
-    # JSON 保存
     json_path = f"{REPORT_DIR}/quality_report.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
         
-    # Markdown 生成
     md_path = f"{REPORT_DIR}/summary.md"
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(f"## 📊 数据质量报告 (Data Quality Report)\n")
@@ -179,36 +185,29 @@ def main():
         if s.get('status') == 'Success':
             f.write(f"- **全局健康度**: {s['global_score']} / 100\n")
             
-            # === 资金流向专属区块 (用户指定要求) ===
+            # === 资金流向专属区块 ===
             ff = s.get('fund_flow_data', {})
             if ff:
                 f.write(f"\n#### 💰 资金流向质量专区\n")
-                
-                # 评分颜色
                 score = ff['score']
                 icon = "🟢" if score >= 90 else ("🟡" if score >= 60 else "🔴")
                 
                 f.write(f"- **资金流健康评分**: {icon} **{score}** / 100\n")
-                f.write(f"- **总记录数**: {ff['total_rows']:,}\n")
-                f.write(f"- **股票数量**: {ff['stock_count']}\n")
-                f.write(f"- **日期范围**: {ff['date_range']}\n")
+                f.write(f"- **K线日期范围**: {ff['date_range']}\n")
+                # 【核心新增】
+                f.write(f"- **资金流覆盖始于**: **{ff['ff_start_date']}** (在此之前无数据属正常)\n")
                 
-                # 异常数显示
                 anom = ff['anomaly_count']
-                anom_str = f"{anom:,}" if anom > 0 else "0 (完美)"
-                f.write(f"- **数据异常数**: ⚠️ {anom_str} (含 NaN 或 0 值)\n")
+                f.write(f"- **数据异常数**: ⚠️ {anom:,} (早期历史空值 + 近期停牌)\n")
                 
-                # 详细统计折叠
                 det = ff['details']
                 f.write(f"\n> **统计细节**: 多头天数 {det['pos_days']:,} | 空头天数 {det['neg_days']:,} | 单日最大流入 {format_money(det['max_in'])}\n")
             
-            # 其他指标
             om = s.get('other_metrics', {})
             f.write(f"\n#### 🛠 其他指标\n")
             f.write(f"- 市值异常记录(<=0): {om.get('invalid_mkt_cap')}\n")
             f.write(f"- 复权因子缺失率: {om.get('missing_factor_pct')}%\n")
 
-            # 字段表
             f.write(f"\n#### 📋 字段字典\n| 字段 | 类型 | 说明 |\n|---|---|---|\n")
             for field in s['schema']:
                 f.write(f"| `{field['name']}` | {field['type']} | {field['desc']} |\n")
