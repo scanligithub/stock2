@@ -1,5 +1,6 @@
 # scripts/data_quality_check.py
 import pandas as pd
+import numpy as np
 import os
 import json
 import datetime
@@ -11,23 +12,16 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 # ================= 数据字典 =================
 STOCK_FIELD_DESC = {
     "date": "交易日期 (YYYY-MM-DD)",
-    "code": "股票代码 (e.g. sh.600519)",
-    "open": "开盘价 (原始)",
-    "high": "最高价 (原始)",
-    "low": "最低价 (原始)",
+    "code": "股票代码",
     "close": "收盘价 (原始)",
-    "volume": "成交量 (股)",
-    "amount": "成交额 (元)",
-    "turn": "换手率 (%)",
-    "pctChg": "涨跌幅 (%)",
     "peTTM": "滚动市盈率",
-    "pbMRQ": "市净率 (MRQ)",
-    
-    "adjustFactor": "后复权因子 (乘数，用于计算真实价格)",
-    "mkt_cap": "流通市值 (元，估算值)",
-    
-    "net_flow_amount": "净流入金额 (元)",
-    "main_net_flow": "主力净流入 (超大+大单)",
+    "pbMRQ": "市净率",
+    "adjustFactor": "后复权因子",
+    "mkt_cap": "流通市值 (元)",
+    "volume": "成交量",
+    "turn": "换手率",
+    "net_flow_amount": "净流入金额 (全单, 元)",
+    "main_net_flow": "主力净流入 (超大+大单, 元)",
     "super_large_net_flow": "超大单净流入",
     "large_net_flow": "大单净流入",
     "medium_small_net_flow": "中小单净流入"
@@ -37,15 +31,9 @@ SECTOR_FIELD_DESC = {
     "date": "交易日期",
     "code": "板块代码",
     "name": "板块名称",
-    "market": "市场代码 (90/1)",
-    "open": "开盘点位",
+    "type": "类型",
     "close": "收盘点位",
-    "high": "最高点位",
-    "low": "最低点位",
-    "volume": "成交量 (手)",
-    "amount": "成交额 (元)",
-    "turnover": "换手率 (%)",
-    "type": "板块类型 (行业/概念/地域)"
+    "pctChg": "涨跌幅"
 }
 
 def get_schema_info(df, desc_map):
@@ -62,6 +50,13 @@ def get_schema_info(df, desc_map):
         })
     return schema
 
+def format_money(val):
+    if pd.isna(val): return "N/A"
+    abs_val = abs(val)
+    if abs_val >= 10**8: return f"{val/10**8:.2f} 亿"
+    elif abs_val >= 10**4: return f"{val/10**4:.2f} 万"
+    else: return f"{val:.2f}"
+
 def check_stock_data():
     file_path = f"{ENGINE_DIR}/stock_full.parquet"
     if not os.path.exists(file_path):
@@ -74,68 +69,86 @@ def check_stock_data():
     if total_rows == 0:
         return {"status": "Error", "message": "File is empty"}
 
+    # --- 基础指标 ---
     unique_stocks = df['code'].nunique()
     min_date = str(df['date'].min())
     max_date = str(df['date'].max())
     
-    missing_flow = df['main_net_flow'].isnull().sum()
-    # 检查因子缺失
+    # --- 资金流向专属质检 (Fund Flow Specifics) ---
+    ff_stats = {}
+    if 'net_flow_amount' in df.columns:
+        # 1. 异常定义：空值 (NaN) + 零值 (0)
+        nan_count = df['net_flow_amount'].isnull().sum()
+        zero_count = (df['net_flow_amount'] == 0).sum()
+        anomaly_count = nan_count + zero_count
+        
+        # 2. 资金流健康评分 (Fund Flow Health Score)
+        # 基础分 100，每 1% 异常扣 1 分
+        anomaly_rate = anomaly_count / total_rows
+        ff_score = max(0, 100 - int(anomaly_rate * 100))
+        
+        # 3. 统计详情
+        pos_flow = (df['net_flow_amount'] > 0).sum()
+        neg_flow = (df['net_flow_amount'] < 0).sum()
+        max_inflow = df['net_flow_amount'].max()
+        max_outflow = df['net_flow_amount'].min()
+        
+        ff_stats = {
+            "score": ff_score,
+            "total_rows": int(total_rows),
+            "stock_count": int(unique_stocks),
+            "date_range": f"{min_date} ~ {max_date}",
+            "anomaly_count": int(anomaly_count), # 异常数
+            "details": {
+                "nan_rows": int(nan_count),
+                "zero_rows": int(zero_count),
+                "pos_days": int(pos_flow),
+                "neg_days": int(neg_flow),
+                "max_in": float(max_inflow),
+                "max_out": float(max_outflow)
+            }
+        }
+    
+    # --- 全局指标 ---
     missing_factor = df['adjustFactor'].isnull().sum() if 'adjustFactor' in df.columns else total_rows
-    # 检查市值异常 (<=0)
     invalid_cap = (df['mkt_cap'] <= 0).sum() if 'mkt_cap' in df.columns else 0
     
-    score = 100
-    if missing_flow / total_rows > 0.5: score -= 10
-    if invalid_cap / total_rows > 0.1: score -= 10
+    # 全局评分
+    global_score = 100
+    if ff_stats.get('score', 0) < 60: global_score -= 20
+    if invalid_cap / total_rows > 0.1: global_score -= 10
     
     return {
         "status": "Success",
-        "health_score": score,
+        "global_score": global_score,
         "total_rows": int(total_rows),
         "stock_count": int(unique_stocks),
         "date_range": f"{min_date} ~ {max_date}",
-        "missing_fund_flow_pct": round(missing_flow / total_rows * 100, 2),
-        "missing_factor_pct": round(missing_factor / total_rows * 100, 2),
-        "invalid_mkt_cap_count": int(invalid_cap),
+        "other_metrics": {
+            "missing_factor_pct": round(missing_factor / total_rows * 100, 2),
+            "invalid_mkt_cap": int(invalid_cap)
+        },
+        "fund_flow_data": ff_stats,
         "schema": get_schema_info(df, STOCK_FIELD_DESC)
     }
 
 def check_sector_data():
     full_path = f"{ENGINE_DIR}/sector_full.parquet"
-    list_path = f"{ENGINE_DIR}/sector_list.parquet"
-    
     if not os.path.exists(full_path):
         return {"status": "Error", "message": "File not found"}
     
     print(f"🔍 检查板块表: {full_path} ...")
     df = pd.read_parquet(full_path)
-    
-    df_meta = pd.DataFrame()
-    if os.path.exists(list_path):
-        df_meta = pd.read_parquet(list_path)
-    
     total_rows = len(df)
-    unique_sectors = df['code'].nunique()
     
     if total_rows == 0: return {"status": "Error", "message": "Empty"}
 
-    max_date = df['date'].max()
-    min_date = df['date'].min()
-    latest_count = df[df['date'] == max_date]['code'].nunique()
-    
-    type_stats = {}
-    if not df_meta.empty and 'type' in df_meta.columns:
-        valid_meta = df_meta[df_meta['code'].isin(df['code'].unique())]
-        type_stats = valid_meta['type'].value_counts().to_dict()
-    
     return {
         "status": "Success",
         "total_rows": int(total_rows),
-        "sector_count": int(unique_sectors),
-        "date_range": f"{str(min_date)[:10]} ~ {str(max_date)[:10]}",
-        "latest_date": str(max_date)[:10],
-        "latest_coverage": f"{latest_count}/{unique_sectors}",
-        "type_breakdown": type_stats,
+        "sector_count": int(df['code'].nunique()),
+        "date_range": f"{str(df['date'].min())[:10]} ~ {str(df['date'].max())[:10]}",
+        "latest_date": str(df['date'].max())[:10],
         "schema": get_schema_info(df, SECTOR_FIELD_DESC)
     }
 
@@ -149,25 +162,53 @@ def main():
         "sector_data": sector_res
     }
     
+    # JSON 保存
     json_path = f"{REPORT_DIR}/quality_report.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
         
+    # Markdown 生成
     md_path = f"{REPORT_DIR}/summary.md"
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(f"## 📊 数据质量报告 (Data Quality Report)\n")
         f.write(f"**生成时间**: {report['generate_time']} (UTC)\n\n")
         
-        # Stock
+        # --- Stock Section ---
         s = report['stock_data']
         f.write(f"### 🚀 个股全量表 (Stock Full)\n")
         if s.get('status') == 'Success':
-            f.write(f"- **健康评分**: {s['health_score']} / 100\n")
-            f.write(f"- **总记录数**: {s['total_rows']:,}\n")
-            f.write(f"- **股票数量**: {s['stock_count']}\n")
-            f.write(f"- **日期范围**: {s['date_range']}\n")
-            f.write(f"- **市值异常数(<=0)**: {s.get('invalid_mkt_cap_count', 0)}\n")
+            f.write(f"- **全局健康度**: {s['global_score']} / 100\n")
             
+            # === 资金流向专属区块 (用户指定要求) ===
+            ff = s.get('fund_flow_data', {})
+            if ff:
+                f.write(f"\n#### 💰 资金流向质量专区\n")
+                
+                # 评分颜色
+                score = ff['score']
+                icon = "🟢" if score >= 90 else ("🟡" if score >= 60 else "🔴")
+                
+                f.write(f"- **资金流健康评分**: {icon} **{score}** / 100\n")
+                f.write(f"- **总记录数**: {ff['total_rows']:,}\n")
+                f.write(f"- **股票数量**: {ff['stock_count']}\n")
+                f.write(f"- **日期范围**: {ff['date_range']}\n")
+                
+                # 异常数显示
+                anom = ff['anomaly_count']
+                anom_str = f"{anom:,}" if anom > 0 else "0 (完美)"
+                f.write(f"- **数据异常数**: ⚠️ {anom_str} (含 NaN 或 0 值)\n")
+                
+                # 详细统计折叠
+                det = ff['details']
+                f.write(f"\n> **统计细节**: 多头天数 {det['pos_days']:,} | 空头天数 {det['neg_days']:,} | 单日最大流入 {format_money(det['max_in'])}\n")
+            
+            # 其他指标
+            om = s.get('other_metrics', {})
+            f.write(f"\n#### 🛠 其他指标\n")
+            f.write(f"- 市值异常记录(<=0): {om.get('invalid_mkt_cap')}\n")
+            f.write(f"- 复权因子缺失率: {om.get('missing_factor_pct')}%\n")
+
+            # 字段表
             f.write(f"\n#### 📋 字段字典\n| 字段 | 类型 | 说明 |\n|---|---|---|\n")
             for field in s['schema']:
                 f.write(f"| `{field['name']}` | {field['type']} | {field['desc']} |\n")
@@ -176,16 +217,13 @@ def main():
         
         f.write("\n---\n")
         
-        # Sector
+        # --- Sector Section ---
         sec = report['sector_data']
         f.write(f"### 🌍 板块全量表 (Sector Full)\n")
         if sec.get('status') == 'Success':
             f.write(f"- **板块数量**: {sec['sector_count']}\n")
+            f.write(f"- **总记录数**: {sec['total_rows']:,}\n")
             f.write(f"- **最新日期**: **{sec['latest_date']}**\n")
-            if sec.get('type_breakdown'):
-                breakdown = ", ".join([f"{k}:{v}" for k, v in sec['type_breakdown'].items()])
-                f.write(f"- **分类**: {breakdown}\n")
-            
             f.write(f"\n#### 📋 字段字典\n| 字段 | 类型 | 说明 |\n|---|---|---|\n")
             for field in sec['schema']:
                 f.write(f"| `{field['name']}` | {field['type']} | {field['desc']} |\n")
