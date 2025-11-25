@@ -9,6 +9,59 @@ ENGINE_DIR = "final_output/engine"
 REPORT_DIR = "final_output/report"
 os.makedirs(REPORT_DIR, exist_ok=True)
 
+# ================= 字段含义定义 (Data Dictionary) =================
+STOCK_FIELD_DESC = {
+    "date": "交易日期 (YYYY-MM-DD)",
+    "code": "股票代码 (e.g. sh.600519)",
+    "open": "开盘价 (不复权)",
+    "high": "最高价 (不复权)",
+    "low": "最低价 (不复权)",
+    "close": "收盘价 (不复权)",
+    "volume": "成交量 (股)",
+    "amount": "成交额 (元)",
+    "turn": "换手率 (%)",
+    "pctChg": "涨跌幅 (%)",
+    "peTTM": "滚动市盈率",
+    "pbMRQ": "市净率 (MRQ)",
+    "adjustFactor": "后复权因子 (用于计算真实走势)",
+    "net_flow_amount": "净流入金额 (元)",
+    "main_net_flow": "主力净流入 (超大+大单)",
+    "super_large_net_flow": "超大单净流入",
+    "large_net_flow": "大单净流入",
+    "medium_small_net_flow": "中小单净流入"
+}
+
+SECTOR_FIELD_DESC = {
+    "date": "交易日期",
+    "code": "板块代码",
+    "name": "板块名称",
+    "open": "开盘点位",
+    "close": "收盘点位",
+    "high": "最高点位",
+    "low": "最低点位",
+    "volume": "成交量 (手)",
+    "amount": "成交额 (元)",
+    "turnover": "换手率 (%)",
+    "type": "板块类型 (行业/概念/地域)"
+}
+
+def get_schema_info(df, desc_map):
+    """获取 DataFrame 的 Schema 信息"""
+    schema = []
+    for col in df.columns:
+        dtype = str(df[col].dtype)
+        # 简化类型描述
+        if 'float' in dtype: dtype = 'float'
+        elif 'int' in dtype: dtype = 'int'
+        elif 'object' in dtype: dtype = 'string'
+        
+        schema.append({
+            "name": col,
+            "type": dtype,
+            "desc": desc_map.get(col, "自定义/其他字段")
+        })
+    return schema
+
 def check_stock_data():
     file_path = f"{ENGINE_DIR}/stock_full.parquet"
     if not os.path.exists(file_path):
@@ -44,7 +97,8 @@ def check_stock_data():
         "date_range": f"{min_date} ~ {max_date}",
         "missing_fund_flow_pct": round(missing_flow / total_rows * 100, 2),
         "missing_factor_pct": round(missing_factor / total_rows * 100, 2),
-        "invalid_price_count": int(neg_close)
+        "invalid_price_count": int(neg_close),
+        "schema": get_schema_info(df, STOCK_FIELD_DESC) # 新增 Schema
     }
 
 def check_sector_data():
@@ -68,34 +122,28 @@ def check_sector_data():
     if total_rows == 0:
         return {"status": "Error", "message": "Sector file is empty"}
 
-    # 1. 时效性检查 (Freshness)
+    # 1. 时效性检查
     max_date = df['date'].max()
     min_date = df['date'].min()
-    # 统计最新日期有多少板块更新了
     latest_count = df[df['date'] == max_date]['code'].nunique()
     miss_update = unique_sectors - latest_count
     
-    # 2. 逻辑完整性 (Integrity)
-    # 最高价 < 最低价 的错误行数
+    # 2. 逻辑完整性
     logic_error = (df['high'] < df['low']).sum()
-    # 成交量 < 0
     neg_vol = (df['volume'] < 0).sum()
     
-    # 3. 分类统计 (如果元数据存在)
+    # 3. 分类统计
     type_stats = {}
     if not df_meta.empty:
-        # 假设 sector_list 有 'type' 列 (行业/概念/地域)
         if 'type' in df_meta.columns:
-            # 只统计有数据的板块
             valid_codes = df['code'].unique()
             valid_meta = df_meta[df_meta['code'].isin(valid_codes)]
             type_counts = valid_meta['type'].value_counts()
             type_stats = type_counts.to_dict()
     
     # 4. 历史长度统计
-    # 每个板块的数据行数
     counts = df['code'].value_counts()
-    avg_history = int(counts.mean())
+    avg_history = int(counts.mean()) if not counts.empty else 0
     
     return {
         "status": "Success",
@@ -107,7 +155,8 @@ def check_sector_data():
         "miss_update_count": int(miss_update),
         "avg_history_days": avg_history,
         "logic_errors": int(logic_error + neg_vol),
-        "type_breakdown": type_stats
+        "type_breakdown": type_stats,
+        "schema": get_schema_info(df, SECTOR_FIELD_DESC) # 新增 Schema
     }
 
 def main():
@@ -141,7 +190,13 @@ def main():
             f.write(f"- **股票数量**: {s['stock_count']}\n")
             f.write(f"- **日期范围**: {s['date_range']}\n")
             f.write(f"- **资金流缺失率**: {s['missing_fund_flow_pct']}%\n")
-            f.write(f"- **复权因子缺失率**: {s['missing_factor_pct']}%\n")
+            
+            # 字段表
+            f.write(f"\n#### 📋 字段字典\n")
+            f.write(f"| 字段名 | 类型 | 说明 |\n")
+            f.write(f"| :--- | :--- | :--- |\n")
+            for field in s['schema']:
+                f.write(f"| `{field['name']}` | {field['type']} | {field['desc']} |\n")
         else:
             f.write(f"❌ Error: {s.get('message')}\n")
         
@@ -153,22 +208,19 @@ def main():
         if sec.get('status') == 'Success':
             f.write(f"- **总记录数**: {sec['total_rows']:,}\n")
             f.write(f"- **板块数量**: {sec['sector_count']}\n")
-            f.write(f"- **平均历史**: {sec['avg_history_days']} 个交易日 (约 {round(sec['avg_history_days']/250, 1)} 年)\n")
             f.write(f"- **最新日期**: **{sec['latest_date']}**\n")
             
-            # 覆盖率检查
-            cov_icon = "🟢" if sec['miss_update_count'] == 0 else "🟡"
-            f.write(f"- **最新覆盖**: {cov_icon} {sec['latest_coverage']} (未更新: {sec['miss_update_count']})\n")
-            
-            # 异常检查
-            err_icon = "🟢" if sec['logic_errors'] == 0 else "🔴"
-            f.write(f"- **逻辑异常**: {err_icon} {sec['logic_errors']} 行 (H<L 或 Vol<0)\n")
-            
-            # 类型分布
+            # 分类统计 (如果存在)
             if sec.get('type_breakdown'):
-                f.write(f"\n**板块分类统计**:\n")
-                for k, v in sec['type_breakdown'].items():
-                    f.write(f"- {k}: {v} 个\n")
+                breakdown_str = ", ".join([f"{k}:{v}" for k, v in sec['type_breakdown'].items()])
+                f.write(f"- **分类统计**: {breakdown_str}\n")
+
+            # 字段表
+            f.write(f"\n#### 📋 字段字典\n")
+            f.write(f"| 字段名 | 类型 | 说明 |\n")
+            f.write(f"| :--- | :--- | :--- |\n")
+            for field in sec['schema']:
+                f.write(f"| `{field['name']}` | {field['type']} | {field['desc']} |\n")
         else:
             f.write(f"❌ Error: {sec.get('message')}\n")
 
