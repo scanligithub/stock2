@@ -2,10 +2,10 @@ name: A-Share Daily ETL Pipeline
 
 on:
   schedule:
-    # 北京时间 21:00 (UTC 13:00) 自动触发，确保所有数据源已更新
+    # 北京时间 21:00 (UTC 13:00) 自动触发
     - cron: '0 13 * * *'
   workflow_dispatch:
-    # 允许手动触发进行测试或补录
+    # 允许手动触发
 
 jobs:
   # ====================================================
@@ -46,7 +46,7 @@ jobs:
       matrix:
         task_index: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
       max-parallel: 20
-      fail-fast: false # 某一个分片失败不影响其他分片
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
       
@@ -125,7 +125,6 @@ jobs:
         
       - name: Download Sector Data
         env:
-          # 【关键】注入 Cloudflare Worker 地址以绕过反爬
           CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
         run: python scripts/download_sector.py
         
@@ -159,10 +158,10 @@ jobs:
           # 移动 资金流分片
           find all_artifacts -name "flow_part_*" -exec cp -r {}/. downloaded_fundflow/ \;
           
-          # 移动 板块数据 (忽略错误，防止空)
+          # 移动 板块数据
           cp -r all_artifacts/sector_data/* final_output/engine/ 2>/dev/null || true
           
-          # 移动 元数据 (stock_list.json)
+          # 移动 元数据
           cp all_artifacts/meta-data/stock_list.json final_output/meta/
 
       - uses: actions/setup-python@v5
@@ -185,11 +184,13 @@ jobs:
         if: success()
         run: cat final_output/report/summary.md >> $GITHUB_STEP_SUMMARY
 
-      # 5. 上传质检报告 Artifact (JSON + MD)
-      - uses: actions/upload-artifact@v4
+      # 5. 【新增】将最终生成的 OSS 文件全部上传到 GitHub Artifacts
+      # 这样你可以在 GitHub 页面直接下载这一包数据，内容与上传到 OSS 的完全一致
+      - name: Upload OSS Assets to Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: quality-report
-          path: final_output/report/
+          name: oss-ready-data
+          path: final_output/
 
       # 6. 配置 OSS 工具
       - name: Setup ossutil
