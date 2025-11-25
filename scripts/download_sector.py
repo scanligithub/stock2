@@ -4,49 +4,43 @@ import pandas as pd
 import time
 import random
 import os
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import sys
 
 OUTPUT_DIR = "final_output/engine"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "http://quote.eastmoney.com/",
-    "Connection": "close"  # 【关键修改】主动关闭长连接，防止 RemoteDisconnected
-}
+# 从环境变量获取 Cloudflare Worker 地址
+# 格式如: https://xxx.xxx.workers.dev
+CF_WORKER_URL = os.getenv("CF_WORKER_URL")
 
-def create_session():
-    """创建一个高可用的 Session"""
-    session = requests.Session()
-    # 增加重试次数到 5 次，增加 backoff_factor (重试间隔时间)
-    retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504, 104])
-    session.mount('http://', HTTPAdapter(max_retries=retries))
-    session.mount('https://', HTTPAdapter(max_retries=retries))
-    session.headers.update(HEADERS)
-    return session
-
-# 全局 session
-sess = create_session()
+if not CF_WORKER_URL:
+    print("❌ 错误: 未设置 CF_WORKER_URL 环境变量！")
+    # 为了防止你本地运行报错，这里可以写死一个方便调试，但在 GitHub 上必须用 Secrets
+    # CF_WORKER_URL = "https://你的worker地址" 
+    sys.exit(1)
 
 def get_sector_list_by_type(name, fs):
-    """自动翻页获取板块列表"""
+    """通过 CF Worker 获取板块列表"""
     sectors = []
     page = 1
-    page_size = 100
+    page_size = 100 # Worker 速度快，可以尝试大一点，但东财限制单页100
     
     print(f"正在获取 {name} 列表...", end="", flush=True)
     
     while True:
-        url = "http://17.push2.eastmoney.com/api/qt/clist/get"
+        # 请求 Worker，带上 target_func=list
         params = {
+            "target_func": "list",  # 告诉 Worker 我们要访问列表接口
             "pn": page, "pz": page_size, "po": 1, "np": 1, 
             "ut": "bd1d9ddb04089700cf9c27f6f7426281",
             "fltt": 2, "invt": 2, "fid": "f3", "fs": fs,
             "fields": "f12,f13,f14" 
         }
+        
         try:
-            res = sess.get(url, params=params, timeout=15).json()
+            # 直接请求 Worker，不需要复杂的 Headers，Worker 会帮我们加
+            res = requests.get(CF_WORKER_URL, params=params, timeout=20).json()
+            
             if res and res.get('data') and res['data'].get('diff'):
                 data = res['data']['diff']
                 for item in data:
@@ -56,7 +50,6 @@ def get_sector_list_by_type(name, fs):
                 if len(data) < page_size:
                     break
                 page += 1
-                time.sleep(0.5) # 翻页稍微停顿一下
             else:
                 break
         except Exception as e:
@@ -67,7 +60,6 @@ def get_sector_list_by_type(name, fs):
     return sectors
 
 def get_sector_list():
-    """获取全量板块"""
     all_sectors = []
     targets = {
         "行业": "m:90 t:2",
@@ -79,13 +71,11 @@ def get_sector_list():
         all_sectors.extend(data)
         
     df = pd.DataFrame(all_sectors)
-    # 可能有些板块获取失败导致为空，做个判断
-    if df.empty:
-        return pd.DataFrame(columns=['code', 'market', 'name'])
+    if df.empty: return pd.DataFrame()
     return df.rename(columns={'f12': 'code', 'f13': 'market', 'f14': 'name'})
 
 def get_history(code, market):
-    """获取历史数据"""
+    """通过 CF Worker 获取历史 K 线"""
     clean_code = str(code)
     
     # 构造 secid
@@ -94,8 +84,9 @@ def get_history(code, market):
     else:
         secid = f"{market}.{clean_code}"
 
-    url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+    # 构造 Worker 请求参数
     params = {
+        "target_func": "kline", # 告诉 Worker 我们要访问K线接口
         "secid": secid,
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
@@ -103,8 +94,7 @@ def get_history(code, market):
     }
     
     try:
-        # timeout 增加到 15秒
-        res = sess.get(url, params=params, timeout=15).json()
+        res = requests.get(CF_WORKER_URL, params=params, timeout=20).json()
         
         if res and res.get('data') and res['data'].get('klines'):
             klines = res['data']['klines']
@@ -115,11 +105,10 @@ def get_history(code, market):
             df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
             return df
         else:
-            # 备用方案重试
+            # 备用方案（处理 BK 前缀问题）
             if ".BK" in secid:
-                alt_secid = secid.replace(".BK", ".")
-                params['secid'] = alt_secid
-                res_alt = sess.get(url, params=params, timeout=15).json()
+                params['secid'] = secid.replace(".BK", ".")
+                res_alt = requests.get(CF_WORKER_URL, params=params, timeout=20).json()
                 if res_alt and res_alt.get('data') and res_alt['data'].get('klines'):
                      klines = res_alt['data']['klines']
                      data = [x.split(',') for x in klines]
@@ -130,27 +119,28 @@ def get_history(code, market):
                      return df
 
     except Exception as e:
-        # 此时的 error 通常是重试多次后依然失败
-        print(f"Failed {code}: {e}")
+        # CF Worker 可能会返回 500 或 502，如果不打印具体错误很难排查
+        # print(f"Error {code}: {e}") 
+        pass
     
     return pd.DataFrame()
 
 def main():
-    print("Step 1: 扫描全市场板块 (稳健模式)...")
+    print(f"🚀 使用代理加速: {CF_WORKER_URL}")
+    print("Step 1: 扫描全市场板块...")
     df_list = get_sector_list()
     
     if df_list.empty:
-        print("❌ 列表获取失败，退出。")
+        print("❌ 列表获取失败，可能是 Worker 配置错误或额度耗尽。")
         return
 
     df_list.drop_duplicates(subset=['code'], inplace=True)
-    print(f"✅ 去重后待下载板块总数: {len(df_list)} 个")
+    print(f"✅ 待下载板块总数: {len(df_list)} 个")
     
     df_list.to_parquet(f"{OUTPUT_DIR}/sector_list.parquet", index=False)
     
-    print(f"Step 2: 开始下载历史数据...")
+    print(f"Step 2: 并发下载历史数据...")
     all_dfs = []
-    
     total = len(df_list)
     success_count = 0
     
@@ -164,8 +154,9 @@ def main():
         if idx % 50 == 0:
             print(f"  进度: {idx}/{total} | 成功: {success_count}")
         
-        # 【关键】增加延迟到 0.2 - 0.4 秒，宁慢勿挂
-        time.sleep(random.uniform(0.2, 0.4))
+        # Cloudflare 抗压能力极强，我们不需要 sleep 很久，0.05秒足够
+        # 甚至可以尝试 0 秒，但为了保险起见保留一点点
+        time.sleep(0.05)
         
     if all_dfs:
         print("正在合并...")
