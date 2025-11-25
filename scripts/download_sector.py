@@ -44,7 +44,7 @@ def get_sector_list_raw(name, fs):
             try:
                 if CF_WORKER_URL:
                     params["target_func"] = "list"
-                    # 增加超时时间到 30s
+                    # 代理模式增加超时时间
                     resp = requests.get(CF_WORKER_URL, params=params, timeout=30)
                 else:
                     resp = requests.get(base_url, params=params, headers=HEADERS, timeout=10)
@@ -60,7 +60,7 @@ def get_sector_list_raw(name, fs):
         # --- 处理结果 ---
         if not success:
             print(f" [Page {page} Failed after 3 retries] ", end="")
-            break # 只有重试 3 次都失败才放弃这一类板块的后续页
+            break 
             
         try:
             if res_json and res_json.get('data') and res_json['data'].get('diff'):
@@ -76,7 +76,7 @@ def get_sector_list_raw(name, fs):
                     break # 最后一页
                 
                 page += 1
-                # 即使是代理模式，翻页时也稍微歇一下，防止 Worker 拥堵
+                # 即使是代理模式，翻页时也稍微歇一下
                 time.sleep(0.2)
             else:
                 break
@@ -100,6 +100,7 @@ def get_sector_list():
 
 def get_history(code, market):
     clean_code = str(code)
+    # 构造 secid
     if str(market) == '90' and not clean_code.startswith('BK'):
         secid = f"{market}.BK{clean_code}"
     else:
@@ -120,6 +121,7 @@ def get_history(code, market):
             base_url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
             res = requests.get(base_url, params=params, headers=HEADERS, timeout=10).json()
         
+        # 1. 成功拿到数据
         if res and res.get('data') and res['data'].get('klines'):
             klines = res['data']['klines']
             data = [x.split(',') for x in klines]
@@ -129,6 +131,7 @@ def get_history(code, market):
             df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
             return df
         
+        # 2. 备用方案 (处理 BK 前缀不一致问题)
         if ".BK" in secid:
             params['secid'] = secid.replace(".BK", ".")
             if CF_WORKER_URL:
@@ -154,7 +157,7 @@ def main():
     if CF_WORKER_URL:
         print(f"🚀 代理模式: {CF_WORKER_URL}")
     else:
-        print("🐢 直连模式")
+        print("🐢 直连模式 (可能会慢/不稳定)")
 
     # 1. 获取目标列表
     print("Step 1: 获取全市场板块列表...")
@@ -162,19 +165,28 @@ def main():
     if df_list.empty:
         print("❌ 列表获取失败")
         return
-        
+    
+    raw_count = len(df_list)
+    
+    # 【核心去重逻辑】
+    # 同一个板块可能既是行业又是概念，按代码去重，保留第一条
     df_list.drop_duplicates(subset=['code'], inplace=True)
-    total_targets = len(df_list)
-    print(f"✅ 目标板块总数: {total_targets} 个")
+    
+    unique_count = len(df_list)
+    print(f"📋 原始扫描: {raw_count} 个 -> 剔除重复: {raw_count - unique_count} 个")
+    print(f"✅ 最终有效目标: {unique_count} 个")
     
     df_list.to_parquet(f"{OUTPUT_DIR}/sector_list.parquet", index=False)
     
-    # 2. 循环补录机制
+    # 2. 循环补录机制 (Retry Loop)
     all_dfs = []
     downloaded_codes = set()
+    
+    # 最多尝试 3 轮
     MAX_ROUNDS = 3
     
     for round_num in range(1, MAX_ROUNDS + 1):
+        # 找出本轮需要下载的 (总目标 - 已成功)
         pending_df = df_list[~df_list['code'].isin(downloaded_codes)]
         
         if pending_df.empty:
@@ -199,10 +211,10 @@ def main():
             if not CF_WORKER_URL:
                 time.sleep(random.uniform(0.1, 0.3))
             else:
-                time.sleep(0.02)
+                time.sleep(0.02) # 代理模式可以很快
     
     # 3. 合并结果
-    print(f"\n📊 最终统计: 目标 {total_targets} -> 成功 {len(downloaded_codes)}")
+    print(f"\n📊 最终统计: 目标 {unique_count} -> 成功 {len(downloaded_codes)}")
     
     if all_dfs:
         print("正在合并宽表...")
