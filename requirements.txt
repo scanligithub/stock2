@@ -3,3 +3,4 @@ baostock
 requests
 pyarrow
 tqdm
+numpy
