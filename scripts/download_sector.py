@@ -19,43 +19,69 @@ HEADERS = {
 }
 
 def get_sector_list_raw(name, fs):
-    """获取原始列表"""
+    """获取原始列表 (带页级重试)"""
     sectors = []
     page = 1
     page_size = 100
     
-    # 如果有 CF Worker，走 Worker
     base_url = "http://17.push2.eastmoney.com/api/qt/clist/get"
     
     print(f"正在获取 {name} 列表...", end="", flush=True)
     
     while True:
-        params = {
-            "pn": page, "pz": page_size, "po": 1, "np": 1, 
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            "fltt": 2, "invt": 2, "fid": "f3", "fs": fs,
-            "fields": "f12,f13,f14" 
-        }
+        # --- 页级重试循环 ---
+        success = False
+        res_json = None
         
+        for retry in range(3): # 每页最多重试 3 次
+            params = {
+                "pn": page, "pz": page_size, "po": 1, "np": 1, 
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "fltt": 2, "invt": 2, "fid": "f3", "fs": fs,
+                "fields": "f12,f13,f14" 
+            }
+            
+            try:
+                if CF_WORKER_URL:
+                    params["target_func"] = "list"
+                    # 增加超时时间到 30s
+                    resp = requests.get(CF_WORKER_URL, params=params, timeout=30)
+                else:
+                    resp = requests.get(base_url, params=params, headers=HEADERS, timeout=10)
+                
+                # 尝试解析 JSON
+                res_json = resp.json()
+                success = True
+                break # 成功则跳出重试
+            except Exception as e:
+                # 失败则等待后重试
+                time.sleep(1)
+        
+        # --- 处理结果 ---
+        if not success:
+            print(f" [Page {page} Failed after 3 retries] ", end="")
+            break # 只有重试 3 次都失败才放弃这一类板块的后续页
+            
         try:
-            if CF_WORKER_URL:
-                params["target_func"] = "list"
-                res = requests.get(CF_WORKER_URL, params=params, timeout=20).json()
-            else:
-                res = requests.get(base_url, params=params, headers=HEADERS, timeout=10).json()
-
-            if res and res.get('data') and res['data'].get('diff'):
-                data = res['data']['diff']
+            if res_json and res_json.get('data') and res_json['data'].get('diff'):
+                data = res_json['data']['diff']
                 for item in data:
                     item['type'] = name
                 sectors.extend(data)
-                if len(data) < page_size: break
+                
+                # 进度点点
+                print(".", end="", flush=True)
+                
+                if len(data) < page_size: 
+                    break # 最后一页
+                
                 page += 1
-                if not CF_WORKER_URL: time.sleep(0.5)
+                # 即使是代理模式，翻页时也稍微歇一下，防止 Worker 拥堵
+                time.sleep(0.2)
             else:
                 break
         except Exception as e:
-            print(f" [Err: {e}] ", end="")
+            print(f" [Data Err: {e}] ", end="")
             break
             
     print(f" -> {len(sectors)} 个")
@@ -74,7 +100,6 @@ def get_sector_list():
 
 def get_history(code, market):
     clean_code = str(code)
-    # 构造 secid
     if str(market) == '90' and not clean_code.startswith('BK'):
         secid = f"{market}.BK{clean_code}"
     else:
@@ -90,12 +115,11 @@ def get_history(code, market):
     try:
         if CF_WORKER_URL:
             params["target_func"] = "kline"
-            res = requests.get(CF_WORKER_URL, params=params, timeout=20).json()
+            res = requests.get(CF_WORKER_URL, params=params, timeout=30).json()
         else:
             base_url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
             res = requests.get(base_url, params=params, headers=HEADERS, timeout=10).json()
         
-        # 成功拿到数据
         if res and res.get('data') and res['data'].get('klines'):
             klines = res['data']['klines']
             data = [x.split(',') for x in klines]
@@ -105,11 +129,10 @@ def get_history(code, market):
             df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
             return df
         
-        # 备用方案 (处理 BK 前缀)
         if ".BK" in secid:
             params['secid'] = secid.replace(".BK", ".")
             if CF_WORKER_URL:
-                res_alt = requests.get(CF_WORKER_URL, params=params, timeout=20).json()
+                res_alt = requests.get(CF_WORKER_URL, params=params, timeout=30).json()
             else:
                 res_alt = requests.get(base_url, params=params, headers=HEADERS, timeout=10).json()
             
@@ -131,7 +154,7 @@ def main():
     if CF_WORKER_URL:
         print(f"🚀 代理模式: {CF_WORKER_URL}")
     else:
-        print("🐢 直连模式 (可能会慢/不稳定)")
+        print("🐢 直连模式")
 
     # 1. 获取目标列表
     print("Step 1: 获取全市场板块列表...")
@@ -149,12 +172,9 @@ def main():
     # 2. 循环补录机制
     all_dfs = []
     downloaded_codes = set()
-    
-    # 最多尝试 3 轮
     MAX_ROUNDS = 3
     
     for round_num in range(1, MAX_ROUNDS + 1):
-        # 找出本轮需要下载的 (总目标 - 已成功)
         pending_df = df_list[~df_list['code'].isin(downloaded_codes)]
         
         if pending_df.empty:
@@ -179,7 +199,7 @@ def main():
             if not CF_WORKER_URL:
                 time.sleep(random.uniform(0.1, 0.3))
             else:
-                time.sleep(0.02) # 代理模式可以很快
+                time.sleep(0.02)
     
     # 3. 合并结果
     print(f"\n📊 最终统计: 目标 {total_targets} -> 成功 {len(downloaded_codes)}")
