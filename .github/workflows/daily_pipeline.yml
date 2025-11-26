@@ -9,7 +9,7 @@ on:
 
 jobs:
   # ====================================================
-  # Job 1: 准备任务分片 (Prepare)
+  # Job 1: 准备任务分片
   # ====================================================
   prepare:
     runs-on: ubuntu-latest
@@ -18,8 +18,8 @@ jobs:
       
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11" # 升级到 3.11 以解决依赖冲突
-          cache: 'pip'           # 开启 pip 缓存加速
+          python-version: "3.10" # 【关键】回归 3.10 兼容性最佳
+          cache: 'pip'
           
       - name: Install dependencies
         run: |
@@ -40,7 +40,7 @@ jobs:
           path: meta_data/
 
   # ====================================================
-  # Job 2: 并行下载 K线 + PE/PB + 复权因子 (Matrix 0-19)
+  # Job 2: 并行下载 K线
   # ====================================================
   download-kline:
     needs: prepare
@@ -60,7 +60,7 @@ jobs:
           
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10" # 【关键】回归 3.10
           cache: 'pip'
       
       - name: Install dependencies
@@ -77,7 +77,7 @@ jobs:
           path: temp_kline/
 
   # ====================================================
-  # Job 3: 并行下载 资金流向 (Matrix 0-19)
+  # Job 3: 并行下载 资金流向
   # ====================================================
   download-fundflow:
     needs: prepare
@@ -97,7 +97,7 @@ jobs:
           
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10" # 【关键】回归 3.10
           cache: 'pip'
       
       - name: Install dependencies
@@ -114,7 +114,7 @@ jobs:
           path: temp_fundflow/
 
   # ====================================================
-  # Job 4: 下载/更新 板块历史数据 (单任务 + Cloudflare Proxy)
+  # Job 4: 下载板块数据
   # ====================================================
   process-sector:
     runs-on: ubuntu-latest
@@ -123,7 +123,7 @@ jobs:
       
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10" # 【关键】回归 3.10
           cache: 'pip'
           
       - name: Install dependencies
@@ -140,7 +140,7 @@ jobs:
           path: final_output/engine/
 
   # ====================================================
-  # Job 5: 合并、指标计算、质检与上传 (Finalize)
+  # Job 5: 合并、计算与上传
   # ====================================================
   finalize:
     needs: [download-kline, download-fundflow, process-sector, prepare]
@@ -148,63 +148,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      # 1. 下载之前所有 Job 的产物
       - uses: actions/download-artifact@v4
         with:
           path: all_artifacts
           
-      - name: Organize Artifacts Structure
+      - name: Organize Artifacts
         run: |
-          # 创建标准目录结构
           mkdir -p downloaded_kline downloaded_fundflow final_output/engine final_output/meta final_output/report
-          
-          # 移动 K线分片
           find all_artifacts -name "kline_part_*" -exec cp -r {}/. downloaded_kline/ \;
-          
-          # 移动 资金流分片
           find all_artifacts -name "flow_part_*" -exec cp -r {}/. downloaded_fundflow/ \;
-          
-          # 移动 板块数据 (忽略错误，防止空)
           cp -r all_artifacts/sector_data/* final_output/engine/ 2>/dev/null || true
-          
-          # 移动 元数据 (stock_list.json)
           cp all_artifacts/meta-data/stock_list.json final_output/meta/
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10" # 【关键】回归 3.10
           cache: 'pip'
           
       - name: Install dependencies
         run: pip install -r requirements.txt
       
-      # 2. 执行核心 ETL：合并宽表 + 计算指标(MA/MACD/KDJ等)
+      # 2. 执行核心 ETL
       - name: Merge Wide Table & Calc Indicators
         run: python scripts/merge_data.py
 
-      # 3. 执行数据质量检查
+      # 3. 执行质检
       - name: Run Data Quality Check
         run: python scripts/data_quality_check.py
         
-      # 4. 将质检简报发布到 GitHub Job Summary
-      - name: Add Quality Summary to Job
+      # 4. 生成简报
+      - name: Add Quality Summary
         if: success()
         run: cat final_output/report/summary.md >> $GITHUB_STEP_SUMMARY
 
-      # 5. 上传质检报告 Artifact (JSON + MD)
+      # 5. 上传质检 Artifact
       - uses: actions/upload-artifact@v4
         with:
           name: quality-report
           path: final_output/report/
 
-      # 6. 【关键】将最终生成的 OSS 文件全部打包到 GitHub Artifacts 供下载检查
+      # 6. 备份到 Artifacts
       - name: Upload OSS Assets to Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: oss-ready-data
           path: final_output/
 
-      # 7. 配置 OSS 工具
+      # 7. 配置 OSS
       - name: Setup ossutil
         uses: manyuanrong/setup-ossutil@v2.0
         with:
@@ -212,24 +202,14 @@ jobs:
           access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
           access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
 
-      # 8. 上传最终结果到 Aliyun OSS
+      # 8. 上传 OSS
       - name: Upload to OSS
         run: |
-          echo "Uploading Metadata..."
           ossutil cp -f final_output/meta/stock_list.json oss://${{ secrets.OSS_BUCKET }}/meta/stock_list.json
-          
-          echo "Uploading Engine Data..."
-          # 上传个股宽表 (大文件，开启并发)
           ossutil cp -f final_output/engine/stock_full.parquet oss://${{ secrets.OSS_BUCKET }}/engine/stock_full.parquet --jobs=10 --part-size=10240000
-          
-          # 上传板块宽表
           ossutil cp -f final_output/engine/sector_full.parquet oss://${{ secrets.OSS_BUCKET }}/engine/sector_full.parquet
-          
-          # 上传板块列表
           ossutil cp -f final_output/engine/sector_list.parquet oss://${{ secrets.OSS_BUCKET }}/engine/sector_list.parquet || true
           
-          echo "Uploading Quality Reports..."
-          # 按日期归档质检报告
           DATE_TAG=$(date +%Y%m%d)
           ossutil cp -f final_output/report/quality_report.json oss://${{ secrets.OSS_BUCKET }}/report/quality_report_${DATE_TAG}.json
 
