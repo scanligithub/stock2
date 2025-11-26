@@ -1,21 +1,8 @@
-# 锁定核心库版本，确保稳定
 pandas>=2.0.0,<2.2.0
 numpy>=1.23.0,<2.0.0
-
-# 数据源
 baostock
 requests
-
-# 存储格式
 pyarrow
 zstandard
-
-# 工具
 tqdm
-
-# 技术指标库
-# 【关键修改】使用 PyPI 官方源的源码包直连地址
-# 1. 绕过 pip 默认不安装 Beta 版的限制
-# 2. 绕过 GitHub 的网络和鉴权问题
-# 3. 这是一个稳定的静态链接
-https://files.pythonhosted.org/packages/a5/de/3700c6360739a23d0e98897b3dd158dbb36f327bb9cd2389d3003a2dd261/pandas_ta-0.3.14b0.tar.gz
+pandas_ta
