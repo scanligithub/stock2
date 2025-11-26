@@ -3,4 +3,6 @@ baostock
 requests
 pyarrow
 tqdm
+zstandard
 numpy
+pandas_ta
