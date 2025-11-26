@@ -1,9 +1,5 @@
-# 核心依赖 (锁定版本以防冲突)
-# Pandas 2.0+ 在 Python 3.10 下最稳定
+# 锁定核心库版本，确保稳定
 pandas>=2.0.0,<2.2.0
-
-# 【关键】必须锁定 Numpy < 2.0.0
-# 这是解决 pandas-ta 安装失败的核心钥匙
 numpy>=1.23.0,<2.0.0
 
 # 数据源
@@ -18,7 +14,8 @@ zstandard
 tqdm
 
 # 技术指标库
-# 【回归 PyPI】
-# 因为我们现在已经降级到了 Python 3.10 且锁定了 Numpy 版本，
-# PyPI 上的标准版现在可以被正确识别和安装了。
-pandas_ta
+# 【关键修改】使用 PyPI 官方源的源码包直连地址
+# 1. 绕过 pip 默认不安装 Beta 版的限制
+# 2. 绕过 GitHub 的网络和鉴权问题
+# 3. 这是一个稳定的静态链接
+https://files.pythonhosted.org/packages/a5/de/3700c6360739a23d0e98897b3dd158dbb36f327bb9cd2389d3003a2dd261/pandas_ta-0.3.14b0.tar.gz
