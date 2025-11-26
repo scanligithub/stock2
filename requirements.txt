@@ -15,5 +15,6 @@ zstandard
 tqdm
 
 # 技术指标库
-# 【关键修改】改为使用 zip 归档链接安装，避开 git clone 鉴权错误
-https://github.com/twopirllc/pandas-ta/archive/development.zip
+# 【关键修改】改为下载 main 分支的 zip 包
+# development 分支已失效，main 分支通常包含最新修复
+https://github.com/twopirllc/pandas-ta/archive/main.zip
