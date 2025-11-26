@@ -1,6 +1,6 @@
-# 核心依赖
+# 核心依赖 (锁定版本以防冲突)
 pandas>=2.0.0,<2.2.0
-# 锁定 Numpy 在 1.x 版本，绝对不要用 2.0+，否则 baostock 和 pandas_ta 都会崩
+# 必须锁定 Numpy < 2.0.0，否则 baostock 会报错
 numpy>=1.23.0,<2.0.0
 
 # 数据源
@@ -15,5 +15,5 @@ zstandard
 tqdm
 
 # 技术指标库
-# 直接从 GitHub 安装开发版，比 PyPI 版更稳定且支持新版 Pandas
-git+https://github.com/twopirllc/pandas-ta.git@development
+# 【关键修改】改为使用 zip 归档链接安装，避开 git clone 鉴权错误
+https://github.com/twopirllc/pandas-ta/archive/development.zip
