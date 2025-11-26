@@ -18,10 +18,13 @@ jobs:
       
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11" # 升级到 3.11 以解决依赖冲突
+          cache: 'pip'           # 开启 pip 缓存加速
           
       - name: Install dependencies
-        run: pip install pandas baostock requests pyarrow tqdm
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
       
       - name: Generate Task Slices
         run: python scripts/prepare_tasks.py
@@ -57,7 +60,8 @@ jobs:
           
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+          cache: 'pip'
       
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -93,7 +97,8 @@ jobs:
           
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+          cache: 'pip'
       
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -118,7 +123,8 @@ jobs:
       
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+          cache: 'pip'
           
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -134,7 +140,7 @@ jobs:
           path: final_output/engine/
 
   # ====================================================
-  # Job 5: 合并、质检与上传 (Finalize)
+  # Job 5: 合并、指标计算、质检与上传 (Finalize)
   # ====================================================
   finalize:
     needs: [download-kline, download-fundflow, process-sector, prepare]
@@ -158,21 +164,22 @@ jobs:
           # 移动 资金流分片
           find all_artifacts -name "flow_part_*" -exec cp -r {}/. downloaded_fundflow/ \;
           
-          # 移动 板块数据
+          # 移动 板块数据 (忽略错误，防止空)
           cp -r all_artifacts/sector_data/* final_output/engine/ 2>/dev/null || true
           
-          # 移动 元数据
+          # 移动 元数据 (stock_list.json)
           cp all_artifacts/meta-data/stock_list.json final_output/meta/
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
+          cache: 'pip'
           
       - name: Install dependencies
         run: pip install -r requirements.txt
       
-      # 2. 执行核心 ETL：合并宽表
-      - name: Merge Wide Table
+      # 2. 执行核心 ETL：合并宽表 + 计算指标(MA/MACD/KDJ等)
+      - name: Merge Wide Table & Calc Indicators
         run: python scripts/merge_data.py
 
       # 3. 执行数据质量检查
@@ -184,15 +191,20 @@ jobs:
         if: success()
         run: cat final_output/report/summary.md >> $GITHUB_STEP_SUMMARY
 
-      # 5. 【新增】将最终生成的 OSS 文件全部上传到 GitHub Artifacts
-      # 这样你可以在 GitHub 页面直接下载这一包数据，内容与上传到 OSS 的完全一致
+      # 5. 上传质检报告 Artifact (JSON + MD)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quality-report
+          path: final_output/report/
+
+      # 6. 【关键】将最终生成的 OSS 文件全部打包到 GitHub Artifacts 供下载检查
       - name: Upload OSS Assets to Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: oss-ready-data
           path: final_output/
 
-      # 6. 配置 OSS 工具
+      # 7. 配置 OSS 工具
       - name: Setup ossutil
         uses: manyuanrong/setup-ossutil@v2.0
         with:
@@ -200,7 +212,7 @@ jobs:
           access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
           access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
 
-      # 7. 上传最终结果到 Aliyun OSS
+      # 8. 上传最终结果到 Aliyun OSS
       - name: Upload to OSS
         run: |
           echo "Uploading Metadata..."
