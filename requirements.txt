@@ -1,8 +1,19 @@
+# 核心依赖 (锁定版本以防冲突)
 pandas>=2.0.0,<2.2.0
 numpy>=1.23.0,<2.0.0
+
+# 数据源
 baostock
 requests
+
+# 存储格式
 pyarrow
 zstandard
+
+# 工具
 tqdm
-pandas_ta
+
+# 技术指标库
+# 【关键修改】使用你找到的稳定镜像链接
+# 注意：这个链接包含了 query 参数，pip 可以处理，但建议加引号包裹以防万一
+https://deleted-packages.pypimirror.stablebuild.com/pandas-ta/pandas_ta-0.3.14b.tar.gz?expires=1764158957075&signature=57d57b4410f52d4c8323945ab16aa5fbfd7b9b514f3285ac01d779fe1f7c9596
