@@ -1,6 +1,9 @@
 # 核心依赖 (锁定版本以防冲突)
+# Pandas 2.0.x - 2.1.x 是目前兼顾性能和兼容性最好的版本
 pandas>=2.0.0,<2.2.0
-# 必须锁定 Numpy < 2.0.0，否则 baostock 会报错
+
+# 【关键】必须锁定 Numpy < 2.0.0
+# 因为 baostock 和 pandas-ta 都不支持 Numpy 2.0
 numpy>=1.23.0,<2.0.0
 
 # 数据源
@@ -15,6 +18,6 @@ zstandard
 tqdm
 
 # 技术指标库
-# 【关键修改】改为下载 main 分支的 zip 包
-# development 分支已失效，main 分支通常包含最新修复
-https://github.com/twopirllc/pandas-ta/archive/main.zip
+# 【回归 PyPI】现在环境依赖已锁定，直接安装 PyPI 版本最稳妥
+# 它是 Beta 版，但完全可用
+pandas-ta
