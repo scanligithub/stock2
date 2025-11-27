@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 # 配置
 OUTPUT_DIR = "temp_kline"
-START_DATE = "1990-01-01" 
+START_DATE = "2005-01-01" 
 TASK_INDEX = int(os.getenv("TASK_INDEX", 0))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
