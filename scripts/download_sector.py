@@ -19,7 +19,7 @@ HEADERS = {
 }
 
 def get_sector_list_raw(name, fs):
-    """获取原始列表 (带页级重试)"""
+    """获取原始列表 (带页级重试 + 自动翻页)"""
     sectors = []
     page = 1
     page_size = 100
@@ -29,11 +29,11 @@ def get_sector_list_raw(name, fs):
     print(f"正在获取 {name} 列表...", end="", flush=True)
     
     while True:
-        # --- 页级重试循环 ---
+        # 页级重试循环
         success = False
         res_json = None
         
-        for retry in range(3): # 每页最多重试 3 次
+        for retry in range(3):
             params = {
                 "pn": page, "pz": page_size, "po": 1, "np": 1, 
                 "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -44,22 +44,18 @@ def get_sector_list_raw(name, fs):
             try:
                 if CF_WORKER_URL:
                     params["target_func"] = "list"
-                    # 代理模式增加超时时间
                     resp = requests.get(CF_WORKER_URL, params=params, timeout=30)
                 else:
                     resp = requests.get(base_url, params=params, headers=HEADERS, timeout=10)
                 
-                # 尝试解析 JSON
                 res_json = resp.json()
                 success = True
-                break # 成功则跳出重试
-            except Exception as e:
-                # 失败则等待后重试
+                break
+            except Exception:
                 time.sleep(1)
         
-        # --- 处理结果 ---
         if not success:
-            print(f" [Page {page} Failed after 3 retries] ", end="")
+            print(f" [Page {page} Failed] ", end="")
             break 
             
         try:
@@ -69,19 +65,16 @@ def get_sector_list_raw(name, fs):
                     item['type'] = name
                 sectors.extend(data)
                 
-                # 进度点点
                 print(".", end="", flush=True)
                 
                 if len(data) < page_size: 
-                    break # 最后一页
+                    break 
                 
                 page += 1
-                # 即使是代理模式，翻页时也稍微歇一下
-                time.sleep(0.2)
+                if not CF_WORKER_URL: time.sleep(0.2)
             else:
                 break
-        except Exception as e:
-            print(f" [Data Err: {e}] ", end="")
+        except Exception:
             break
             
     print(f" -> {len(sectors)} 个")
@@ -97,6 +90,48 @@ def get_sector_list():
     df = pd.DataFrame(all_sectors)
     if df.empty: return pd.DataFrame()
     return df.rename(columns={'f12': 'code', 'f13': 'market', 'f14': 'name'})
+
+def get_constituents(sector_code):
+    """
+    获取指定板块的成分股列表
+    """
+    stocks = []
+    page = 1
+    page_size = 200 # 成分股通常不多，200足够一页
+    
+    # 构造请求用的 code (e.g., BK0425)
+    req_code = f"BK{sector_code}" if not str(sector_code).startswith('BK') else sector_code
+    
+    base_url = "http://4.push2.eastmoney.com/api/qt/clist/get"
+    
+    while True:
+        params = {
+            "pn": page, "pz": page_size, "po": 1, "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2, "invt": 2, "fid": "f3",
+            "fs": f"b:{req_code}", # 关键参数：b:BKxxxx
+            "fields": "f12,f14"    # f12:股票代码, f14:股票名称
+        }
+        
+        try:
+            if CF_WORKER_URL:
+                params["target_func"] = "list" # 复用 list 逻辑
+                res = requests.get(CF_WORKER_URL, params=params, timeout=15).json()
+            else:
+                res = requests.get(base_url, params=params, headers=HEADERS, timeout=10).json()
+
+            if res and res.get('data') and res['data'].get('diff'):
+                data = res['data']['diff']
+                stocks.extend(data)
+                if len(data) < page_size: break
+                page += 1
+                if not CF_WORKER_URL: time.sleep(0.1)
+            else:
+                break
+        except:
+            break
+            
+    return stocks
 
 def get_history(code, market):
     clean_code = str(code)
@@ -169,7 +204,6 @@ def main():
     raw_count = len(df_list)
     
     # 【核心去重逻辑】
-    # 同一个板块可能既是行业又是概念，按代码去重，保留第一条
     df_list.drop_duplicates(subset=['code'], inplace=True)
     
     unique_count = len(df_list)
@@ -178,22 +212,54 @@ def main():
     
     df_list.to_parquet(f"{OUTPUT_DIR}/sector_list.parquet", index=False)
     
-    # 2. 循环补录机制 (Retry Loop)
+    # ==========================================
+    # 2. 【新增】下载成分股映射关系
+    # ==========================================
+    print("Step 1.5: 下载板块成分股映射关系...")
+    all_relations = []
+    sector_codes = df_list['code'].unique()
+    
+    count = 0
+    for sec_code in sector_codes:
+        stocks = get_constituents(sec_code)
+        for s in stocks:
+            all_relations.append({
+                'sector_code': str(sec_code).replace('BK', ''), 
+                'stock_code': s['f12'],
+                'stock_name': s['f14']
+            })
+        
+        count += 1
+        if count % 50 == 0:
+            print(f"  已获取成分股: {count}/{len(sector_codes)} 个板块")
+        
+        # 即使是 Worker，获取成分股也建议保留微小延迟，防止并发过高
+        if not CF_WORKER_URL: time.sleep(0.1)
+        else: time.sleep(0.01)
+            
+    if all_relations:
+        df_rel = pd.DataFrame(all_relations)
+        rel_path = f"{OUTPUT_DIR}/sector_constituents.parquet"
+        df_rel.to_parquet(rel_path, index=False, compression='zstd')
+        print(f"✅ 成分股表已生成: {len(df_rel)} 行 -> {rel_path}")
+    else:
+        print("⚠️ 未获取到成分股关系")
+
+    # ==========================================
+    # 3. 循环补录机制下载 K 线 (Retry Loop)
+    # ==========================================
     all_dfs = []
     downloaded_codes = set()
-    
-    # 最多尝试 3 轮
     MAX_ROUNDS = 3
     
     for round_num in range(1, MAX_ROUNDS + 1):
-        # 找出本轮需要下载的 (总目标 - 已成功)
         pending_df = df_list[~df_list['code'].isin(downloaded_codes)]
         
         if pending_df.empty:
-            print("✨ 所有板块已全部下载完成！")
+            print("✨ 所有板块K线已全部下载完成！")
             break
             
-        print(f"\n🔄 第 {round_num}/{MAX_ROUNDS} 轮下载 (剩余 {len(pending_df)} 个)...")
+        print(f"\n🔄 第 {round_num}/{MAX_ROUNDS} 轮下载K线 (剩余 {len(pending_df)} 个)...")
         
         count = 0
         for _, row in pending_df.iterrows():
@@ -207,13 +273,10 @@ def main():
             if count % 50 == 0:
                 print(f"   进度: {count}/{len(pending_df)} | 当前总成功: {len(downloaded_codes)}")
             
-            # 延时策略
-            if not CF_WORKER_URL:
-                time.sleep(random.uniform(0.1, 0.3))
-            else:
-                time.sleep(0.02) # 代理模式可以很快
+            if not CF_WORKER_URL: time.sleep(random.uniform(0.1, 0.3))
+            else: time.sleep(0.02)
     
-    # 3. 合并结果
+    # 4. 合并结果
     print(f"\n📊 最终统计: 目标 {unique_count} -> 成功 {len(downloaded_codes)}")
     
     if all_dfs:
