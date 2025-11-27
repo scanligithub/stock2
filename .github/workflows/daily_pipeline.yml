@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
     # 允许手动触发
 
-# 赋予 GITHUB_TOKEN 写权限，用于 Cache 和 Releases 操作
+# 赋予 GITHUB_TOKEN 写权限，用于 Releases 和 Cache 操作
 permissions:
   contents: write
 
 jobs:
   # ====================================================
-  # Job 1: 准备任务分片 (Prepare)
+  # Job 1: 准备任务分片
   # ====================================================
   prepare:
     runs-on: ubuntu-latest
@@ -22,11 +22,10 @@ jobs:
       
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10" # 锁定 3.10 以保证最佳兼容性
+          python-version: "3.10"
           cache: 'pip'
           
       - name: Install dependencies
-        # 使用 --pre 允许安装 pandas_ta 的 beta 版本
         run: |
           pip install --upgrade pip
           pip install --pre -r requirements.txt
@@ -45,7 +44,7 @@ jobs:
           path: meta_data/
 
   # ====================================================
-  # Job 2: 并行下载 K线 + 指标数据 (Matrix 0-19)
+  # Job 2: 并行下载 K线
   # ====================================================
   download-kline:
     needs: prepare
@@ -82,7 +81,7 @@ jobs:
           path: temp_kline/
 
   # ====================================================
-  # Job 3: 并行下载 资金流向 (Matrix 0-19)
+  # Job 3: 并行下载 资金流向
   # ====================================================
   download-fundflow:
     needs: prepare
@@ -119,7 +118,7 @@ jobs:
           path: temp_fundflow/
 
   # ====================================================
-  # Job 4: 下载/更新 板块历史数据 (Cloudflare Proxy)
+  # Job 4: 下载/更新 板块历史数据
   # ====================================================
   process-sector:
     runs-on: ubuntu-latest
@@ -152,6 +151,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # 【核心优化】开启 8GB Swap 空间，防止 Pandas 合并数据时 OOM
+      - name: Set up Swap Space
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
       
       # 1. 下载所有中间产物
       - uses: actions/download-artifact@v4
@@ -162,19 +170,23 @@ jobs:
         run: |
           mkdir -p downloaded_kline downloaded_fundflow cache_data final_output/engine final_output/meta final_output/report
           
-          # 移动 K线分片
+          # 移动下载的小文件
           find all_artifacts -name "kline_part_*" -exec cp -r {}/. downloaded_kline/ \;
-          
-          # 移动 资金流分片
           find all_artifacts -name "flow_part_*" -exec cp -r {}/. downloaded_fundflow/ \;
           
-          # 移动 板块和元数据 (使用 true 防止空目录报错)
+          # 移动板块和元数据 (加 true 防止空目录报错)
           cp -r all_artifacts/sector_data/* final_output/engine/ 2>/dev/null || true
           cp all_artifacts/meta-data/stock_list.json final_output/meta/ 2>/dev/null || true
 
-      # 2. 【缓存恢复】恢复当年的热数据 (Stock Hot Data)
-      # 用于 merge_data.py 的逻辑 (虽然全量模式下暂未深度使用，但为增量模式预留)
-      - name: Restore Current Year Cache
+      # 2. 从 Releases 下载历史冷数据
+      - name: Download Historical Archive (Cold Data)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download archive-init --pattern "*.parquet" --dir cache_data || echo "⚠️ No historical archive found in Releases."
+
+      # 3. 从 Cache 恢复当年热数据
+      - name: Restore Current Year Cache (Hot Data)
         uses: actions/cache/restore@v4
         with:
           path: cache_data/stock_current_year.parquet
@@ -190,41 +202,40 @@ jobs:
       - name: Install dependencies
         run: pip install --pre -r requirements.txt
       
-      # 3. 执行核心 ETL
-      # 包含：合并数据 -> 计算全套指标(MA/MACD/KDJ...) -> 冷热数据切分
+      # 4. 执行核心脚本 (高内存消耗步骤)
       - name: Merge Wide Table & Calc Indicators
         run: python scripts/merge_data.py
 
-      # 4. 【缓存保存】保存最新的当年热数据
+      # 5. 保存 Cache
       - name: Save Current Year Cache
         uses: actions/cache/save@v4
         with:
           path: cache_data/stock_current_year.parquet
           key: stock-hot-data-${{ github.run_id }}
 
-      # 5. 执行数据质量检查
+      # 6. 执行质检
       - name: Run Data Quality Check
         run: python scripts/data_quality_check.py
         
-      # 6. 生成简报到 Job Summary
+      # 7. 生成简报
       - name: Add Quality Summary to Job
         if: success()
         run: cat final_output/report/summary.md >> $GITHUB_STEP_SUMMARY
 
-      # 7. 上传质检报告 Artifact
+      # 8. 上传质检 Artifact
       - uses: actions/upload-artifact@v4
         with:
           name: quality-report
           path: final_output/report/
 
-      # 8. 【备份】上传最终结果到 GitHub Artifacts (人工检查用)
+      # 9. 备份 OSS Ready Data 到 Artifacts
       - name: Upload OSS Assets to Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: oss-ready-data
           path: final_output/
 
-      # 9. 配置 OSS 工具
+      # 10. 配置 OSS 工具
       - name: Setup ossutil
         uses: manyuanrong/setup-ossutil@v2.0
         with:
@@ -232,23 +243,23 @@ jobs:
           access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
           access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
 
-      # 10. 上传最终结果到 Aliyun OSS
+      # 11. 上传结果到 Aliyun OSS
       - name: Upload to OSS
         run: |
-          echo "Uploading Metadata..."
           ossutil cp -f final_output/meta/stock_list.json oss://${{ secrets.OSS_BUCKET }}/meta/stock_list.json
           
-          echo "Uploading Stock Data (Recursive)..."
-          # 【关键】递归上传 stock_daily 目录，这将包含：
-          # 1. stock_history_2005_2024.parquet (冷数据)
-          # 2. stock_2025.parquet (热数据)
+          # 上传个股数据目录 (包含 stock_20xx.parquet)
           ossutil cp -r -f final_output/engine/stock_daily/ oss://${{ secrets.OSS_BUCKET }}/engine/stock_daily/
           
-          echo "Uploading Sector Data..."
+          # 上传周/月线数据
+          ossutil cp -f final_output/engine/stock_weekly.parquet oss://${{ secrets.OSS_BUCKET }}/engine/stock_weekly.parquet || true
+          ossutil cp -f final_output/engine/stock_monthly.parquet oss://${{ secrets.OSS_BUCKET }}/engine/stock_monthly.parquet || true
+          
+          # 上传板块数据
           ossutil cp -f final_output/engine/sector_full.parquet oss://${{ secrets.OSS_BUCKET }}/engine/sector_full.parquet
           ossutil cp -f final_output/engine/sector_list.parquet oss://${{ secrets.OSS_BUCKET }}/engine/sector_list.parquet || true
           
-          echo "Uploading Reports..."
+          # 归档质检报告
           DATE_TAG=$(date +%Y%m%d)
           ossutil cp -f final_output/report/quality_report.json oss://${{ secrets.OSS_BUCKET }}/report/quality_report_${DATE_TAG}.json
 
