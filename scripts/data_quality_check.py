@@ -11,50 +11,36 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 
 # ================= 数据字典 =================
 STOCK_FIELD_DESC = {
-    # 索引
+    # 基础字段
     "date": "交易日期 (YYYY-MM-DD)",
     "code": "股票代码",
-    
-    # 基础行情
-    "open": "开盘价 (原始)",
-    "high": "最高价 (原始)",
-    "low": "最低价 (原始)",
     "close": "收盘价 (原始)",
-    "volume": "成交量",
-    "amount": "成交额",
-    "turn": "换手率",
-    "pctChg": "涨跌幅",
-    
-    # 财务/基本面
     "peTTM": "滚动市盈率",
     "pbMRQ": "市净率",
-    "mkt_cap": "流通市值 (元)",
     "adjustFactor": "后复权因子",
+    "mkt_cap": "流通市值 (元)",
     
     # 资金流
-    "net_flow_amount": "净流入金额 (全单)",
-    "main_net_flow": "主力净流入 (超大+大单)",
-    "super_large_net_flow": "超大单净流入",
-    "large_net_flow": "大单净流入",
-    "medium_small_net_flow": "中小单净流入",
+    "net_flow_amount": "净流入金额 (全单, 元)",
+    "main_net_flow": "主力净流入 (超大+大单, 元)",
     
-    # === 新增指标 ===
+    # === 新增技术指标 ===
     # 均线
     "ma5": "5日均线", "ma10": "10日均线", "ma20": "20日均线",
-    "ma60": "60日均线", "ma120": "120日均线", "ma250": "250日均线",
+    "ma60": "60日均线", "ma120": "120日均线 (半年线)", "ma250": "250日均线 (年线)",
     
     # 均量
     "vol_ma5": "5日均量", "vol_ma10": "10日均量",
-    "vol_ma20": "20日均量", "vol_ma30": "30日均量",
+    "vol_ma20": "20日均量 (月均量)", "vol_ma30": "30日均量",
     
     # MACD
-    "dif": "MACD DIF", "dea": "MACD DEA", "macd": "MACD 柱",
+    "dif": "MACD DIF快线", "dea": "MACD DEA慢线", "macd": "MACD 柱状图",
     
     # KDJ
-    "k": "KDJ K", "d": "KDJ D", "j": "KDJ J",
+    "k": "KDJ K值", "d": "KDJ D值", "j": "KDJ J值",
     
     # RSI
-    "rsi6": "RSI 6", "rsi12": "RSI 12", "rsi24": "RSI 24",
+    "rsi6": "RSI (6日)", "rsi12": "RSI (12日)", "rsi24": "RSI (24日)",
     
     # BOLL
     "boll_up": "布林上轨", "boll_lb": "布林下轨",
@@ -105,13 +91,15 @@ def check_stock_data():
     if total_rows == 0:
         return {"status": "Error", "message": "File is empty"}
 
+    # --- 基础指标 ---
     unique_stocks = df['code'].nunique()
     min_date = str(df['date'].min())
     max_date = str(df['date'].max())
     
-    # 资金流检查
+    # --- 资金流向专属质检 ---
     ff_stats = {}
     valid_ff_count = 0 
+    
     if 'net_flow_amount' in df.columns:
         nan_count = df['net_flow_amount'].isnull().sum()
         zero_count = (df['net_flow_amount'] == 0).sum()
@@ -119,7 +107,10 @@ def check_stock_data():
         valid_ff_count = total_rows - anomaly_count
         
         valid_ff_df = df[df['net_flow_amount'].notna() & (df['net_flow_amount'] != 0)]
-        ff_start_date = str(valid_ff_df['date'].min()) if not valid_ff_df.empty else "无有效数据"
+        if not valid_ff_df.empty:
+            ff_start_date = str(valid_ff_df['date'].min())
+        else:
+            ff_start_date = "无有效数据"
 
         anomaly_rate = anomaly_count / total_rows
         ff_score = max(0, 100 - int(anomaly_rate * 100))
@@ -133,10 +124,13 @@ def check_stock_data():
             "valid_count": int(valid_ff_count),
             "start_date": ff_start_date,
             "anomaly_count": int(anomaly_count),
-            "details": {"pos_days": int(pos_flow), "neg_days": int(neg_flow), "max_in": float(max_inflow)}
+            "details": {
+                "pos_days": int(pos_flow),
+                "neg_days": int(neg_flow),
+                "max_in": float(max_inflow)
+            }
         }
     
-    # 全局检查
     missing_factor = df['adjustFactor'].isnull().sum() if 'adjustFactor' in df.columns else total_rows
     invalid_cap = (df['mkt_cap'] <= 0).sum() if 'mkt_cap' in df.columns else 0
     
@@ -213,13 +207,23 @@ def main():
                 f.write(f"\n#### 💰 资金流向详情\n")
                 score = ff['score']
                 icon = "🟢" if score >= 90 else ("🟡" if score >= 60 else "🔴")
+                
                 f.write(f"- **资金流健康评分**: {icon} **{score}** / 100\n")
-                f.write(f"- **覆盖始于**: **{ff['start_date']}**\n")
+                f.write(f"- **资金流覆盖始于**: **{ff['start_date']}**\n")
+                f.write(f"- **K线日期范围**: {s['date_range']}\n")
+                
+                anom = ff['anomaly_count']
+                f.write(f"- **空值/零值数**: ⚠️ {anom:,} (2010年前或停牌)\n")
                 
                 det = ff['details']
-                f.write(f"\n> **统计**: 多头 {det['pos_days']:,} | 空头 {det['neg_days']:,} | 极值 {format_money(det['max_in'])}\n")
+                f.write(f"\n> **博弈统计**: 多头 {det['pos_days']:,} 天 | 空头 {det['neg_days']:,} 天 | 极值 {format_money(det['max_in'])}\n")
             
-            f.write(f"\n#### 📋 字段字典 ({len(s['schema'])}个)\n| 字段 | 类型 | 说明 |\n|---|---|---|\n")
+            om = s.get('other_metrics', {})
+            f.write(f"\n#### 🛠 其他指标\n")
+            f.write(f"- 市值异常(<=0): {om.get('invalid_mkt_cap')}\n")
+            f.write(f"- 复权因子缺失: {om.get('missing_factor_pct')}%\n")
+
+            f.write(f"\n#### 📋 字段字典\n| 字段 | 类型 | 说明 |\n|---|---|---|\n")
             for field in s['schema']:
                 f.write(f"| `{field['name']}` | {field['type']} | {field['desc']} |\n")
         else:
