@@ -9,6 +9,7 @@ requests
 # 存储格式
 pyarrow
 zstandard
+duckdb
 
 # 工具
 tqdm
