@@ -10,7 +10,7 @@ import pandas as pd
 # ================== 配置区域 ==================
 # 【开关】True = 测试模式 (100只); False = 全量模式 (5000+只)
 # 你可以在这里手动修改，或者通过环境变量 TEST_MODE=true 来覆盖
-DEFAULT_TEST_MODE = True  
+DEFAULT_TEST_MODE = False  
 
 # 检查环境变量 (GitHub Actions 传入)
 ENV_TEST_MODE = os.getenv("TEST_MODE", "").lower() == "true"
