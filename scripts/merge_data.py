@@ -120,8 +120,12 @@ def process_resample(writer_w, writer_m, df_daily):
             df_w['code'] = df_daily['code'].iloc[0]
             for w in [5, 10, 20]:
                 df_w[f'ma{w}'] = df_w['close'].rolling(w).mean()
+            
+            # 安全转换
             float_cols = df_w.select_dtypes(include=['float64']).columns
-            df_w[float_cols] = df_w[float_cols].astype('float32')
+            for col in float_cols:
+                df_w[col] = pd.to_numeric(df_w[col], errors='coerce').astype('float32')
+            
             table_w = pa.Table.from_pandas(df_w)
             writer_w.write_table(table_w)
     except: pass
@@ -133,14 +137,18 @@ def process_resample(writer_w, writer_m, df_daily):
             df_m['code'] = df_daily['code'].iloc[0]
             for w in [5, 10, 20]:
                 df_m[f'ma{w}'] = df_m['close'].rolling(w).mean()
+            
+            # 安全转换
             float_cols = df_m.select_dtypes(include=['float64']).columns
-            df_m[float_cols] = df_m[float_cols].astype('float32')
+            for col in float_cols:
+                df_m[col] = pd.to_numeric(df_m[col], errors='coerce').astype('float32')
+            
             table_m = pa.Table.from_pandas(df_m)
             writer_m.write_table(table_m)
     except: pass
 
 def main():
-    print("🚀 开始 DuckDB 流式合并与计算 (Schema 锁定版)...")
+    print("🚀 开始 DuckDB 流式合并与计算 (安全转换版)...")
     
     all_codes, history_files, kline_files = get_all_codes()
     if not all_codes:
@@ -156,22 +164,18 @@ def main():
     # 注册历史视图
     has_history = False
     if history_files:
-        files_sql = str(history_files).replace('[', '').replace(']', '')
-        con.execute(f"CREATE OR REPLACE VIEW history_view AS SELECT * FROM read_parquet({files_sql})")
-        has_history = True
+        try:
+            files_sql = str(history_files).replace('[', '').replace(']', '')
+            con.execute(f"CREATE OR REPLACE VIEW history_view AS SELECT * FROM read_parquet({files_sql})")
+            has_history = True
+        except: pass
 
-    # =========================================================
-    # 【核心修复】构造标准 Dummy Schema
-    # 不依赖 sample_df 推断，而是手动定义全量字段模板
-    # 确保 Date 是 string，数值是 float32
-    # =========================================================
+    # 定义 Schema
     print("🔒 锁定数据 Schema...")
-    
     dummy_data = {
-        'date': ['2025-01-01'], # 强制 String
-        'code': ['dummy'],      # 强制 String
+        'date': ['2025-01-01'], 
+        'code': ['dummy'],      
     }
-    # 定义所有可能出现的数值列
     float_cols_def = [
         'open', 'close', 'high', 'low', 'volume', 'amount', 'turn', 'pctChg', 
         'peTTM', 'pbMRQ', 'adjustFactor', 'mkt_cap', 
@@ -183,14 +187,10 @@ def main():
     ]
     
     for c in float_cols_def:
-        dummy_data[c] = [0.0] # 初始为 float
+        dummy_data[c] = [0.0]
         
     df_schema_template = pd.DataFrame(dummy_data)
-    
-    # 强制转换类型
     df_schema_template[float_cols_def] = df_schema_template[float_cols_def].astype('float32')
-    
-    # 获取绝对正确的 Schema
     final_schema = pa.Table.from_pandas(df_schema_template).schema
     
     # 初始化 Writers
@@ -210,7 +210,9 @@ def main():
         # A. 读取历史
         df_hist = pd.DataFrame()
         if has_history:
-            df_hist = con.execute(f"SELECT * FROM history_view WHERE code='{code}'").fetchdf()
+            try:
+                df_hist = con.execute(f"SELECT * FROM history_view WHERE code='{code}'").fetchdf()
+            except: pass
         
         # B. 读取今日
         df_new = pd.DataFrame()
@@ -220,49 +222,48 @@ def main():
             
         if df_hist.empty and df_new.empty: continue
             
-        # 统一日期
-        if not df_hist.empty: df_hist['date'] = pd.to_datetime(df_hist['date'])
-        if not df_new.empty: df_new['date'] = pd.to_datetime(df_new['date'])
+        # 统一日期 (转换为 datetime 对象)
+        if not df_hist.empty: 
+            df_hist['date'] = pd.to_datetime(df_hist['date'], errors='coerce')
+        if not df_new.empty: 
+            df_new['date'] = pd.to_datetime(df_new['date'], errors='coerce')
         
         # 合并
         df = pd.concat([df_hist, df_new])
-        # 必须清除空日期的行
         df.dropna(subset=['date'], inplace=True)
         df.drop_duplicates(subset=['code', 'date'], keep='last', inplace=True)
         df.sort_values('date', inplace=True)
         
         # D. 关联资金流
-        if code in flow_map:
-            if os.path.exists(flow_map[code]):
-                try:
-                    df_flow = pd.read_parquet(flow_map[code])
-                    df_flow['date'] = pd.to_datetime(df_flow['date'])
-                    
-                    # 仅对 new data 关联，还是全量？全量关联最稳
-                    df = pd.merge(df, df_flow, on=['date', 'code'], how='left', suffixes=('', '_new'))
-                    
-                    # 合并新旧资金流列
-                    flow_raw_cols = ['net_flow_amount', 'main_net_flow', 'super_large_net_flow', 'large_net_flow', 'medium_small_net_flow']
-                    for col in flow_raw_cols:
-                        if f"{col}_new" in df.columns:
-                            df[col] = df[f"{col}_new"].combine_first(df[col])
-                            df.drop(columns=[f"{col}_new"], inplace=True)
-                except: pass
+        if code in flow_map and os.path.exists(flow_map[code]):
+            try:
+                df_flow = pd.read_parquet(flow_map[code])
+                df_flow['date'] = pd.to_datetime(df_flow['date'], errors='coerce')
+                
+                # Merge
+                df = pd.merge(df, df_flow, on=['date', 'code'], how='left', suffixes=('', '_new'))
+                
+                # Update cols
+                flow_raw_cols = ['net_flow_amount', 'main_net_flow', 'super_large_net_flow', 'large_net_flow', 'medium_small_net_flow']
+                for col in flow_raw_cols:
+                    if f"{col}_new" in df.columns:
+                        df[col] = df[f"{col}_new"].combine_first(df[col])
+                        df.drop(columns=[f"{col}_new"], inplace=True)
+            except: pass
 
         # E. 计算指标
         df = calculate_indicators(df)
         
-        # F. 生成周/月线 (使用内存df)
+        # F. 生成周/月线
         process_resample(None, None, df)
         
-        # 内嵌 Buffer 收集 (周/月线)
+        # Buffer 收集逻辑 (简化版复制)
         agg_rules = {
             'open': 'first', 'close': 'last', 'high': 'max', 'low': 'min',
             'volume': 'sum', 'amount': 'sum', 'turn': 'mean',
             'peTTM': 'last', 'pbMRQ': 'last', 'mkt_cap': 'last', 'adjustFactor': 'last'
         }
-        flow_raw_cols = ['net_flow_amount', 'main_net_flow', 'super_large_net_flow', 'large_net_flow', 'medium_small_net_flow']
-        for c in flow_raw_cols: 
+        for c in ['net_flow_amount', 'main_net_flow']: 
             if c in df.columns: agg_rules[c] = 'sum'
             
         try:
@@ -278,7 +279,7 @@ def main():
         except: pass
 
         # G. 写入 Parquet
-        # 补齐缺失列 (用 NaN)
+        # 补齐 Schema
         for col in final_schema.names:
             if col not in df.columns:
                 df[col] = np.nan
@@ -286,8 +287,12 @@ def main():
         # 按照 Schema 顺序重排
         df = df[final_schema.names]
         
-        # 强制类型转换 (Float32)
-        df[float_cols_def] = df[float_cols_def].astype('float32')
+        # 【关键修复】安全的类型转换
+        # 使用 to_numeric 强制转数字，无法转换的(如错误的日期对象)变NaN
+        for col in float_cols_def:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').astype('float32')
+        
         # 日期转 String
         df['date'] = df['date'].dt.strftime('%Y-%m-%d')
         
@@ -313,20 +318,25 @@ def main():
         df_w = pd.concat(weekly_buffer, ignore_index=True)
         df_w = df_w.groupby('code', group_keys=False).apply(lambda x: calculate_indicators(x.sort_values('date')))
         
-        float_cols = df_w.select_dtypes(include=['float64']).columns
-        df_w[float_cols] = df_w[float_cols].astype('float32')
+        # 同样使用安全转换
+        float_cols = df_w.select_dtypes(include=['float64', 'object']).columns
+        for col in float_cols:
+            if col in float_cols_def:
+                 df_w[col] = pd.to_numeric(df_w[col], errors='coerce').astype('float32')
+
         df_w['date'] = df_w['date'].dt.strftime('%Y-%m-%d')
-        
         df_w.to_parquet(f"{OUTPUT_ENGINE}/stock_weekly.parquet", index=False, compression='zstd')
         
     if monthly_buffer:
         df_m = pd.concat(monthly_buffer, ignore_index=True)
         df_m = df_m.groupby('code', group_keys=False).apply(lambda x: calculate_indicators(x.sort_values('date')))
         
-        float_cols = df_m.select_dtypes(include=['float64']).columns
-        df_m[float_cols] = df_m[float_cols].astype('float32')
+        float_cols = df_m.select_dtypes(include=['float64', 'object']).columns
+        for col in float_cols:
+            if col in float_cols_def:
+                 df_m[col] = pd.to_numeric(df_m[col], errors='coerce').astype('float32')
+
         df_m['date'] = df_m['date'].dt.strftime('%Y-%m-%d')
-        
         df_m.to_parquet(f"{OUTPUT_ENGINE}/stock_monthly.parquet", index=False, compression='zstd')
 
     print("🎉 任务全部完成")
