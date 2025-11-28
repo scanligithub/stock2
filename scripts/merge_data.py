@@ -18,34 +18,47 @@ FLOW_DIR = "downloaded_fundflow"
 
 # 输出目录
 OUTPUT_ENGINE = "final_output/engine"
-OUTPUT_DAILY = f"{OUTPUT_ENGINE}/stock_daily" # 存放 OSS 用的当年文件
-CACHE_OUTPUT_FILE = f"{CACHE_DIR}/stock_buffer.parquet" # 存放给明天用的全量Buffer
+OUTPUT_DAILY = f"{OUTPUT_ENGINE}/stock_daily" 
+CACHE_OUTPUT_FILE = f"{CACHE_DIR}/stock_buffer.parquet" 
 
 os.makedirs(OUTPUT_DAILY, exist_ok=True)
 
 # === DuckDB 初始化 ===
-# 限制 DuckDB 使用内存上限，给 Python 预留空间
 con = duckdb.connect(database=':memory:')
 con.execute("SET memory_limit='4GB';") 
-con.execute("SET threads=2;") # 限制线程数，避免 GHA 资源争抢
+con.execute("SET threads=2;")
 
-def get_files_list():
-    """获取所有需要合并的文件列表"""
+def get_all_codes():
+    """
+    分别扫描历史文件和今日增量文件，获取全量股票代码
+    """
+    codes = set()
+    
+    # 1. 从历史 Cache 中获取代码 (如果有)
     history_files = glob.glob(f"{CACHE_DIR}/*.parquet")
+    if history_files:
+        print(f"📦 扫描历史文件: {len(history_files)} 个")
+        # DuckDB 读取列极其快
+        try:
+            # 这里的 files_sql 是为了让 duckdb 读取列表
+            files_sql = str(history_files).replace('[', '').replace(']', '')
+            df_codes = con.execute(f"SELECT DISTINCT code FROM read_parquet({files_sql})").fetchdf()
+            codes.update(df_codes['code'].tolist())
+        except Exception as e:
+            print(f"⚠️ 读取历史代码失败 (可能是空文件): {e}")
+
+    # 2. 从今日增量获取代码
     kline_files = glob.glob(f"{KLINE_DIR}/**/*.parquet", recursive=True)
-    
-    # 资金流文件做成字典，方便 SQL 关联 (如果 DuckDB 直接关联太慢，我们在 Python 里做)
-    # 这里策略：资金流先不进 DuckDB 视图，在 Python 处理单只股票时再 merge，这样最稳
-    flow_files = glob.glob(f"{FLOW_DIR}/**/*.parquet", recursive=True)
-    flow_map = {os.path.basename(f): f for f in flow_files}
-    
-    return history_files + kline_files, flow_map
+    print(f"🔥 扫描今日增量: {len(kline_files)} 个")
+    for f in kline_files:
+        # 文件名即代码 (例如 sz.000001.parquet)
+        code = os.path.basename(f).replace('.parquet', '')
+        codes.add(code)
+        
+    return sorted(list(codes)), history_files, kline_files
 
 def calculate_indicators(df):
-    """
-    计算单只股票的技术指标
-    df 已经包含了 full history
-    """
+    """计算技术指标"""
     # 1. 价格均线
     for w in [5, 10, 20, 60, 120, 250]:
         df[f'ma{w}'] = df['close'].rolling(window=w).mean()
@@ -96,236 +109,272 @@ def calculate_indicators(df):
     return df
 
 def process_resample(writer_w, writer_m, df_daily):
-    """
-    流式生成周/月线
-    注意：这里的 df_daily 只是单只股票的数据，内存很小
-    """
+    """流式生成周/月线"""
     if df_daily.empty: return
 
-    # 聚合规则
     agg_rules = {
         'open': 'first', 'close': 'last', 'high': 'max', 'low': 'min',
         'volume': 'sum', 'amount': 'sum', 'turn': 'mean',
         'peTTM': 'last', 'pbMRQ': 'last', 'mkt_cap': 'last', 'adjustFactor': 'last'
     }
-    # 资金流字段累加
+    # 资金流累加
     flow_cols = [c for c in df_daily.columns if 'flow' in c]
     for c in flow_cols: agg_rules[c] = 'sum'
 
-    # 生成周线
+    # 周线
     try:
         df_w = df_daily.set_index('date').resample('W-FRI').agg(agg_rules).dropna(subset=['close']).reset_index()
-        # 简单计算周线均线
         if not df_w.empty:
             df_w['code'] = df_daily['code'].iloc[0]
             for w in [5, 10, 20]:
                 df_w[f'ma{w}'] = df_w['close'].rolling(w).mean()
-            
-            # 写入流
+            # 写入前转类型
+            float_cols = df_w.select_dtypes(include=['float64']).columns
+            df_w[float_cols] = df_w[float_cols].astype('float32')
             table_w = pa.Table.from_pandas(df_w)
             writer_w.write_table(table_w)
     except: pass
 
-    # 生成月线
+    # 月线
     try:
         df_m = df_daily.set_index('date').resample('ME').agg(agg_rules).dropna(subset=['close']).reset_index()
         if not df_m.empty:
             df_m['code'] = df_daily['code'].iloc[0]
             for w in [5, 10, 20]:
                 df_m[f'ma{w}'] = df_m['close'].rolling(w).mean()
-            
+            float_cols = df_m.select_dtypes(include=['float64']).columns
+            df_m[float_cols] = df_m[float_cols].astype('float32')
             table_m = pa.Table.from_pandas(df_m)
             writer_m.write_table(table_m)
     except: pass
 
 def main():
-    print("🚀 开始 DuckDB 流式合并与计算...")
+    print("🚀 开始 DuckDB 流式合并与计算 (Schema 修复版)...")
     
-    # 1. 准备文件列表
-    input_files, flow_map = get_files_list()
-    if not input_files:
-        print("❌ 没有找到任何 K 线文件")
+    # 1. 获取所有股票代码 & 文件列表
+    all_codes, history_files, kline_files = get_all_codes()
+    
+    if not all_codes:
+        print("❌ 没有找到任何股票代码")
         return
+        
+    print(f"✅ 总计需处理: {len(all_codes)} 只股票")
 
-    # 2. 在 DuckDB 中建立统一视图 (Virtual View)
-    # 使用 list 传递文件路径，DuckDB 会自动处理 union
-    # 这一步是零拷贝的，不会读取数据到内存
-    print(f"🔗 正在建立 {len(input_files)} 个文件的虚拟视图...")
-    
-    # 将文件列表转换为 SQL 字符串列表 ['file1', 'file2']
-    files_sql = str(input_files).replace('[', '').replace(']', '')
-    
-    # 创建视图：合并 + 去重 + 排序
-    # QUALIFY row_number... 用于去重 (保留最新的记录)
-    con.execute(f"""
-        CREATE OR REPLACE VIEW raw_kline AS 
-        SELECT * FROM read_parquet({input_files})
-    """)
-    
-    # 获取所有股票代码 (Distinct)
-    print("🔍 扫描所有股票代码...")
-    codes_df = con.execute("SELECT DISTINCT code FROM raw_kline ORDER BY code").fetchdf()
-    all_codes = codes_df['code'].tolist()
-    print(f"✅ 发现 {len(all_codes)} 只股票")
+    # 建立文件索引 (Code -> Path)
+    # kline_map: 今日增量文件
+    kline_map = {os.path.basename(f).replace('.parquet', ''): f for f in kline_files}
+    # flow_map: 资金流文件
+    flow_files = glob.glob(f"{FLOW_DIR}/**/*.parquet", recursive=True)
+    flow_map = {os.path.basename(f).replace('.parquet', ''): f for f in flow_files}
 
-    # 3. 初始化 Parquet Writers (流式写入器)
-    # 我们需要同时写出：
-    # A. 缓存文件 (Full History)
-    # B. OSS 当年文件 (Current Year)
-    # C. 周线/月线文件
+    # 2. 如果有历史文件，注册到 DuckDB 视图方便查询
+    # 注意：这里我们只注册历史文件，不混入今日文件，避免 Schema 冲突
+    has_history = False
+    if history_files:
+        files_sql = str(history_files).replace('[', '').replace(']', '')
+        con.execute(f"CREATE OR REPLACE VIEW history_view AS SELECT * FROM read_parquet({files_sql})")
+        has_history = True
+
+    # 3. 初始化 Writers
+    # 为了获取完整的 Schema (包含所有指标)，我们先模拟处理一只股票
+    print("🔍 推断最终 Schema...")
+    sample_df = pd.DataFrame()
+    
+    # 尝试找一个有历史数据的股票来推断 Schema
+    if has_history:
+        try:
+            sample_code = all_codes[0]
+            sample_df = con.execute(f"SELECT * FROM history_view WHERE code='{sample_code}' LIMIT 10").fetchdf()
+        except: pass
+    
+    # 如果没历史，或者取失败，造一个空的带基础列的 DF
+    if sample_df.empty:
+        sample_df = pd.DataFrame(columns=['date', 'code', 'open', 'close', 'high', 'low', 'volume', 'amount', 'turn', 'pctChg', 'peTTM', 'pbMRQ', 'adjustFactor', 'mkt_cap'])
+    
+    # 确保日期格式
+    if 'date' in sample_df.columns and not sample_df.empty:
+        sample_df['date'] = pd.to_datetime(sample_df['date'])
+        
+    # 模拟计算一次以获得完整列 (包含 ma5, macd 等)
+    sample_df = calculate_indicators(sample_df)
+    
+    # 补齐资金流列 (如果历史数据里没资金流，这里补上，防止 Schema 缺失)
+    flow_cols = ['net_flow_amount', 'main_net_flow', 'super_large_net_flow', 'large_net_flow', 'medium_small_net_flow']
+    for c in flow_cols:
+        if c not in sample_df.columns: sample_df[c] = np.nan
+
+    # 统一转 float32
+    float_cols = sample_df.select_dtypes(include=['float64']).columns
+    sample_df[float_cols] = sample_df[float_cols].astype('float32')
+    
+    # 获取最终 Schema
+    final_schema = pa.Table.from_pandas(sample_df).schema
+    
+    # 定义周/月线 Schema (简化版，先不强校验，用 append 模式)
+    # 这里我们只初始化主文件的 Writer
+    
+    writer_buffer = pq.ParquetWriter(CACHE_OUTPUT_FILE, final_schema, compression='zstd')
     
     current_year = datetime.datetime.now().year
-    
-    # 定义 Schema 占位符 (先读取第一只股票来确定 Schema)
-    first_code = all_codes[0]
-    df_sample = con.execute(f"SELECT * FROM raw_kline WHERE code='{first_code}'").fetchdf()
-    # 模拟计算一次以获取最终 Schema (包含 MA, MACD 等列)
-    df_sample['date'] = pd.to_datetime(df_sample['date'])
-    df_sample = calculate_indicators(df_sample)
-    
-    # 统一转 float32
-    float_cols = df_sample.select_dtypes(include=['float64']).columns
-    df_sample[float_cols] = df_sample[float_cols].astype('float32')
-    
-    schema_full = pa.Table.from_pandas(df_sample).schema
-    # 周月线 Schema 稍有不同，这里简化处理，在 process_resample 内部处理，暂时不预定义 writer schema
-    # 为了简单，周月线我们用 append 模式，或者最后合并。
-    # 鉴于周月线数据量小，我们可以暂存在内存 list 中，最后一次性写出
-    
-    # 打开流式写入器
-    writer_buffer = pq.ParquetWriter(CACHE_OUTPUT_FILE, schema_full, compression='zstd')
-    
-    # OSS 文件路径
     oss_file = f"{OUTPUT_DAILY}/stock_{current_year}.parquet"
-    writer_oss = pq.ParquetWriter(oss_file, schema_full, compression='zstd')
+    writer_oss = pq.ParquetWriter(oss_file, final_schema, compression='zstd')
     
-    # 周月线暂时用内存缓存 (因为它们还要 resample，且体积小)
-    # 300MB 的周线如果分片写可能会导致 footer 开销大，这里我们先收集 buffer
-    # 如果周线也 OOM，那就也得开 Writer。考虑到 GitHub 7GB 内存，周线全量才 300MB，可以放内存。
-    # 为了极致安全，我们还是用 Writer 吧。
-    # 需要先推断周线 Schema... 比较麻烦。
-    # 方案：周月线单独处理，先生成临时文件，最后合并。
-    
+    # 周月线因为不好预判 Schema，暂存内存 list，最后一次性写
     weekly_buffer = []
     monthly_buffer = []
 
-    # 4. 🚀 开始流式处理 (Loop by Code)
-    print("🌊 开始流式处理 (Reading -> Calc -> Writing)...")
-    
-    # 预编译 SQL 提升性能
-    # DuckDB 的 prepare 语句在 Python API 中不直接支持带参数的 DF 返回，直接用 f-string 即可，DuckDB解析很快
+    # 4. 🚀 开始循环处理
+    print("🌊 开始流式处理...")
     
     for code in tqdm(all_codes):
-        # A. 从 DuckDB 读取单只股票的全量历史 (内存占用极小)
-        # 强制按日期排序
-        sql = f"SELECT * FROM raw_kline WHERE code='{code}' ORDER BY date"
-        df = con.execute(sql).fetchdf()
+        # A. 读取历史 (DuckDB)
+        df_hist = pd.DataFrame()
+        if has_history:
+            # 检查该股票是否在历史中
+            # 优化：DuckDB 查询带 WHERE code 很快
+            df_hist = con.execute(f"SELECT * FROM history_view WHERE code='{code}'").fetchdf()
         
-        # B. 关联资金流 (Pandas Merge)
-        # 文件名匹配
-        fname = f"{code}.parquet"
-        if fname in flow_map:
+        # B. 读取今日增量 (Pandas)
+        df_new = pd.DataFrame()
+        if code in kline_map:
             try:
-                df_flow = pd.read_parquet(flow_map[fname])
-                if not df_flow.empty:
-                    df['date'] = pd.to_datetime(df['date'])
-                    df_flow['date'] = pd.to_datetime(df_flow['date'])
-                    # Left Join
-                    df = pd.merge(df, df_flow, on=['date', 'code'], how='left')
+                df_new = pd.read_parquet(kline_map[code])
             except: pass
+            
+        # C. 合并
+        # Pandas concat 会自动对齐列，缺失的列(比如今日数据的MA)会填 NaN，这正是我们想要的
+        if df_hist.empty and df_new.empty:
+            continue
+            
+        # 统一日期
+        if not df_hist.empty: df_hist['date'] = pd.to_datetime(df_hist['date'])
+        if not df_new.empty: df_new['date'] = pd.to_datetime(df_new['date'])
         
-        # 确保日期格式
-        if df['date'].dtype == 'object':
-            df['date'] = pd.to_datetime(df['date'])
+        df = pd.concat([df_hist, df_new])
+        df.drop_duplicates(subset=['code', 'date'], keep='last', inplace=True)
+        df.sort_values('date', inplace=True)
+        
+        # D. 关联资金流 (仅对今日数据关联，历史数据里应该已经有了)
+        # 如果历史数据里缺资金流，这里也会补全
+        if code in flow_map: # 资金流文件名通常也是 code
+            # 注意：资金流文件可能包含多天，merge 时要注意
+            # 但我们的 flow_map 存的是路径，直接读
+            pass # 这里简化，资金流在 download 阶段已经包含了吗？
+            # 资金流是单独下载的，需要在 merge_data.py 里 merge
+            # 我们在 get_files_list 里只拿了路径
+            
+            # 读取资金流
+            # 优化：只读取最近的资金流，避免全量读
+            # 这里简单处理：读取该股票所有的资金流文件
+            # 我们的 flow_map 是 code -> file path (假设 flow 也是按 code 分片的)
+            # 如果下载脚本产生的 flow 是按 code 分片的，那就对了
+            
+            # 检查是否有对应的资金流文件 (downloaded_fundflow/sz.000001.parquet)
+            flow_path = os.path.join(FLOW_DIR, f"{code}.parquet")
+            if os.path.exists(flow_path):
+                try:
+                    df_flow = pd.read_parquet(flow_path)
+                    df_flow['date'] = pd.to_datetime(df_flow['date'])
+                    
+                    # Merge (Left Join)
+                    # update: 仅对那些还没有资金流数据的行进行 merge
+                    # 为简单起见，直接 merge，pandas 会处理后缀，我们取 _y (new) 覆盖 _x (old) 或者 combine_first
+                    # 最简单：直接 merge，如果有重名列，取资金流表里的
+                    
+                    df = pd.merge(df, df_flow, on=['date', 'code'], how='left', suffixes=('', '_new'))
+                    
+                    # 如果有 _new 列，说明有更新，覆盖回去
+                    for col in flow_cols:
+                        if f"{col}_new" in df.columns:
+                            df[col] = df[f"{col}_new"].combine_first(df[col])
+                            df.drop(columns=[f"{col}_new"], inplace=True)
+                except: pass
 
-        # C. 计算指标 (Pandas/TA)
+        # E. 计算指标 (填补 NaN)
         df = calculate_indicators(df)
         
-        # D. 生成周/月线 (Resample)
-        process_resample(None, None, df) # 临时禁用 Writer，改为收集
-        # 修改 process_resample 逻辑使其返回 df，而不是 write
-        # 这里为了不破坏结构，我们把聚合逻辑提取出来
+        # F. 生成周/月线 (使用内存中的 df)
+        process_resample(None, None, df) # 逻辑不变，存入 buffer
         
-        # --- 周/月线 收集逻辑 (内嵌) ---
+        # 内嵌 buffer 收集逻辑
+        # (为了代码简洁，这里复制 process_resample 里的 agg 逻辑)
         agg_rules = {
             'open': 'first', 'close': 'last', 'high': 'max', 'low': 'min',
             'volume': 'sum', 'amount': 'sum', 'turn': 'mean',
             'peTTM': 'last', 'pbMRQ': 'last', 'mkt_cap': 'last', 'adjustFactor': 'last'
         }
-        for c in ['net_flow_amount', 'main_net_flow']: 
+        for c in flow_cols: 
             if c in df.columns: agg_rules[c] = 'sum'
             
-        # 周线
         try:
             w_df = df.set_index('date').resample('W-FRI').agg(agg_rules).dropna(subset=['close']).reset_index()
             w_df['code'] = code
             weekly_buffer.append(w_df)
         except: pass
         
-        # 月线
         try:
             m_df = df.set_index('date').resample('ME').agg(agg_rules).dropna(subset=['close']).reset_index()
             m_df['code'] = code
             monthly_buffer.append(m_df)
         except: pass
-        # -----------------------------
 
-        # E. 数据类型优化 (准备写入日线)
-        float_cols = df.select_dtypes(include=['float64']).columns
-        df[float_cols] = df[float_cols].astype('float32')
+        # G. 写入 Parquet (Buffer & OSS)
+        # 类型转换
+        float_cols_curr = df.select_dtypes(include=['float64']).columns
+        df[float_cols_curr] = df[float_cols_curr].astype('float32')
         df['date'] = df['date'].dt.strftime('%Y-%m-%d')
         
-        # F. 写入 Full Buffer (给缓存用)
-        # 需要对齐列名，防止资金流列有的股票有，有的没有
-        # 补齐缺失列
-        for col in schema_full.names:
+        # 补齐 Schema (防止某些股票缺列)
+        for col in final_schema.names:
             if col not in df.columns:
                 df[col] = np.nan
         
-        # 按照 Schema 顺序重排
-        df = df[schema_full.names]
+        # 排序对齐
+        df = df[final_schema.names]
         
-        table = pa.Table.from_pandas(df, schema=schema_full)
+        # 写入 Cache Buffer
+        table = pa.Table.from_pandas(df, schema=final_schema)
         writer_buffer.write_table(table)
         
-        # G. 写入 OSS Current Year (仅今年)
+        # 写入 OSS (Current Year)
         df_curr = df[df['date'] >= f"{current_year}-01-01"]
         if not df_curr.empty:
-            table_curr = pa.Table.from_pandas(df_curr, schema=schema_full)
+            table_curr = pa.Table.from_pandas(df_curr, schema=final_schema)
             writer_oss.write_table(table_curr)
             
-        # H. 显式垃圾回收 (非常重要)
+        # 垃圾回收
         del df, table
-        # 每处理 100 只股票 GC 一次，平衡速度与内存
-        # if i % 100 == 0: gc.collect() 
+        # if i % 100 == 0: gc.collect()
 
-    # 5. 关闭 Writers
     writer_buffer.close()
     writer_oss.close()
-    print("✅ 日线数据处理完成 (Buffer + OSS)")
+    print("✅ 日线数据写入完成")
 
-    # 6. 统一保存周/月线
-    # 因为周月线数据量小 (周线~300MB, 月线~80MB)，concat 没问题
-    print("📅 保存周/月线数据...")
+    # 5. 保存周/月线
+    print("📅 保存周/月线...")
     if weekly_buffer:
         df_w = pd.concat(weekly_buffer, ignore_index=True)
-        # 计算周线指标 (全量算更快)
+        # 批量计算周线指标
         df_w = df_w.groupby('code', group_keys=False).apply(lambda x: calculate_indicators(x.sort_values('date')))
-        # 压缩保存
+        
+        # 压缩
         float_cols = df_w.select_dtypes(include=['float64']).columns
         df_w[float_cols] = df_w[float_cols].astype('float32')
         df_w['date'] = df_w['date'].dt.strftime('%Y-%m-%d')
+        
         df_w.to_parquet(f"{OUTPUT_ENGINE}/stock_weekly.parquet", index=False, compression='zstd')
-    
+        
     if monthly_buffer:
         df_m = pd.concat(monthly_buffer, ignore_index=True)
         df_m = df_m.groupby('code', group_keys=False).apply(lambda x: calculate_indicators(x.sort_values('date')))
+        
         float_cols = df_m.select_dtypes(include=['float64']).columns
         df_m[float_cols] = df_m[float_cols].astype('float32')
         df_m['date'] = df_m['date'].dt.strftime('%Y-%m-%d')
+        
         df_m.to_parquet(f"{OUTPUT_ENGINE}/stock_monthly.parquet", index=False, compression='zstd')
 
-    print("🎉 全流程结束！")
+    print("🎉 任务全部完成")
 
 if __name__ == "__main__":
     main()
