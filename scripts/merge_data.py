@@ -1,209 +1,214 @@
 # scripts/merge_data.py
 import pandas as pd
-import glob
-import os
-import gc  # 引入垃圾回收
-import pandas_ta as ta
 import numpy as np
+import pandas_ta as ta
+import os
+import glob
 import datetime
+from tqdm import tqdm  # 【关键修复】补上了这个导入
 
-# 路径配置
-CACHE_DIR = "cache_data" 
-TODAY_DIR = "downloaded_kline" # 注意：这里要对应 artifact 下载后的目录名
-FUND_DIR = "downloaded_fundflow"
-OUTPUT_DIR = "final_output/engine"
+# === 路径配置 ===
+CACHE_DIR = "cache_data"          # 历史数据(Release+Cache)存放地
+KLINE_DIR = "downloaded_kline"    # 今日K线增量
+FLOW_DIR = "downloaded_fundflow"  # 今日资金流增量
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(f"{OUTPUT_DIR}/stock_daily", exist_ok=True)
+# 输出目录
+OUTPUT_ENGINE = "final_output/engine"
+OUTPUT_DAILY = f"{OUTPUT_ENGINE}/stock_daily"
 
-def optimize_types(df):
-    """将 float64 降级为 float32 以节省内存"""
-    for col in df.select_dtypes(include=['float64']).columns:
-        df[col] = df[col].astype('float32')
-    return df
+os.makedirs(OUTPUT_DAILY, exist_ok=True)
 
+# === 指标计算函数 ===
 def calculate_indicators(df):
-    """计算单只股票的指标 (输入已排序)"""
-    # 1. 价格均线
+    """
+    计算技术指标 (MA, VolMA, MACD, KDJ, RSI, BOLL, CCI, ATR)
+    df 必须是单只股票且按日期排序
+    """
+    # 1. 价格均线 (MA)
     for w in [5, 10, 20, 60, 120, 250]:
-        df[f'ma{w}'] = df['close'].rolling(w).mean()
+        df[f'ma{w}'] = df['close'].rolling(window=w).mean()
     
-    # 2. 量均线
+    # 2. 成交量均线 (Vol MA)
     for w in [5, 10, 20, 30]:
-        df[f'vol_ma{w}'] = df['volume'].rolling(w).mean()
+        df[f'vol_ma{w}'] = df['volume'].rolling(window=w).mean()
 
-    # 3. 复杂指标 (使用 pandas_ta)
+    # 3. MACD (12, 26, 9)
     try:
-        # MACD (12,26,9)
         macd = df.ta.macd(close='close', fast=12, slow=26, signal=9)
         if macd is not None:
             df['dif'] = macd.iloc[:, 0]
-            df['dea'] = macd.iloc[:, 2]
             df['macd'] = macd.iloc[:, 1]
+            df['dea'] = macd.iloc[:, 2]
+    except: pass
 
-        # KDJ (9,3,3)
+    # 4. KDJ (9, 3, 3)
+    try:
         kdj = df.ta.kdj(high='high', low='low', close='close', length=9, signal=3)
         if kdj is not None:
             df['k'] = kdj.iloc[:, 0]
             df['d'] = kdj.iloc[:, 1]
             df['j'] = kdj.iloc[:, 2]
+    except: pass
 
-        # RSI (6,12,24)
+    # 5. RSI (6, 12, 24)
+    try:
         df['rsi6'] = df.ta.rsi(close='close', length=6)
         df['rsi12'] = df.ta.rsi(close='close', length=12)
         df['rsi24'] = df.ta.rsi(close='close', length=24)
+    except: pass
 
-        # BOLL (20,2)
+    # 6. BOLL (20, 2)
+    try:
         boll = df.ta.bbands(close='close', length=20, std=2)
         if boll is not None:
-            df['boll_up'] = boll.iloc[:, 2]
             df['boll_lb'] = boll.iloc[:, 0]
+            df['boll_up'] = boll.iloc[:, 2]
+    except: pass
 
-        # CCI & ATR
+    # 7. 其他
+    try:
         df['cci'] = df.ta.cci(high='high', low='low', close='close', length=14)
         df['atr'] = df.ta.atr(high='high', low='low', close='close', length=14)
-
-    except Exception:
-        pass
+    except: pass
 
     return df
 
-def main():
-    print("🚀 开始全量合并与周期生成 (内存优化版)...")
+def process_resample(df_daily, freq, filename):
+    """生成周线/月线数据"""
+    print(f"   -> 正在生成 {freq} 周期数据 ({filename})...")
     
-    # === 1. 加载并合并资金流 (如果有) ===
-    # 为了省内存，我们建立一个 {code_date: flow_data} 的字典或者先不处理
-    # 鉴于资金流文件较多，建议先处理 K 线，最后再 Join 资金流，或者分块处理
-    # 这里为了逻辑简单，暂不改变整体流程，但加强内存回收
-    
-    # === 2. 加载 K 线数据 ===
-    history_files = glob.glob(f"{CACHE_DIR}/*.parquet")
-    new_files = glob.glob(f"{TODAY_DIR}/*.parquet")
-    
-    # --- 分批读取 History ---
-    df_history = pd.DataFrame()
-    if history_files:
-        print(f"📦 加载历史文件: {len(history_files)} 个")
-        # 逐个读取并立即转换类型
-        dfs = []
-        for f in history_files:
-            _df = pd.read_parquet(f)
-            _df = optimize_types(_df)
-            dfs.append(_df)
-        df_history = pd.concat(dfs, ignore_index=True)
-        del dfs # 立即释放列表
-        gc.collect() # 强制回收
-
-    # --- 分批读取 New Data ---
-    df_new = pd.DataFrame()
-    if new_files:
-        print(f"🔥 加载今日增量: {len(new_files)} 个")
-        dfs = []
-        for f in tqdm(new_files, desc="Reading New"):
-            _df = pd.read_parquet(f)
-            _df = optimize_types(_df) # 立即瘦身
-            dfs.append(_df)
-        df_new = pd.concat(dfs, ignore_index=True)
-        del dfs
-        gc.collect()
-
-    # === 3. 合并全量 ===
-    if df_history.empty and df_new.empty:
-        print("❌ 无数据")
-        return
-
-    print("🔄 执行全量拼接...")
-    # 统一日期格式
-    if not df_history.empty:
-        df_history['date'] = pd.to_datetime(df_history['date'])
-    if not df_new.empty:
-        df_new['date'] = pd.to_datetime(df_new['date'])
-
-    df_total = pd.concat([df_history, df_new])
-    
-    # 释放旧对象
-    del df_history, df_new
-    gc.collect()
-    print("🧹 内存清理完成")
-
-    # 去重排序
-    print("⚡ 排序与去重...")
-    df_total.drop_duplicates(subset=['code', 'date'], keep='last', inplace=True)
-    df_total.sort_values(['code', 'date'], inplace=True)
-
-    # === 4. 计算指标 ===
-    print("🧮 计算技术指标 (分组运算)...")
-    # 使用 groupby().apply() 会产生大量临时内存，这里优化一下：
-    # 直接在原 DataFrame 上操作可能更省内存，但这需要极其复杂的向量化写法
-    # 我们保持 apply 但确保 df_total 已经是 float32
-    df_total = df_total.groupby('code', group_keys=False).apply(calculate_indicators)
-    
-    # 再次优化类型 (指标计算可能引入了 float64)
-    df_total = optimize_types(df_total)
-    
-    # === 5. Join 资金流 (如果有) ===
-    # (如果资金流数据量大，建议放在计算指标之前 Join，或者单独处理)
-    # 这里假设资金流已包含在 K 线下载逻辑中，或者在此处简单处理
-    
-    # === 6. 生成周期数据 (周/月) ===
-    # 定义聚合规则
+    # 聚合规则
     agg_rules = {
         'open': 'first', 'close': 'last', 'high': 'max', 'low': 'min',
         'volume': 'sum', 'amount': 'sum', 'turn': 'mean',
         'peTTM': 'last', 'pbMRQ': 'last', 'mkt_cap': 'last', 'adjustFactor': 'last'
     }
-    # 动态添加存在的指标列，通常只对 OHLCV 聚合，指标重新算
+    # 资金流累加
+    for c in ['net_flow_amount', 'main_net_flow', 'super_large_net_flow', 'large_net_flow', 'medium_small_net_flow']:
+        if c in df_daily.columns: agg_rules[c] = 'sum'
+
+    # 重采样
+    # 'date' 已经是 datetimeIndex
+    df_res = df_daily.set_index('date').groupby('code').resample(freq).agg(agg_rules)
     
-    def resample_and_save(df_src, freq, name):
-        print(f"📅 生成 {name} 数据...")
-        # 仅对必要列进行重采样，避免不必要的计算
-        valid_cols = [c for c in agg_rules.keys() if c in df_src.columns]
-        current_rules = {k: agg_rules[k] for k in valid_cols}
-        
-        df_res = df_src.set_index('date').groupby('code').resample(freq).agg(current_rules)
-        df_res = df_res.dropna(subset=['close']).reset_index()
-        df_res.sort_values(['code', 'date'], inplace=True)
-        
-        # 重算周/月线指标
-        df_res = df_res.groupby('code', group_keys=False).apply(calculate_indicators)
-        df_res = optimize_types(df_res)
-        
-        # 保存
-        df_res['date'] = df_res['date'].dt.strftime('%Y-%m-%d')
-        out = f"{OUTPUT_DIR}/{name}.parquet"
-        print(f"💾 保存: {out}")
-        df_res.to_parquet(out, index=False, compression='zstd')
-        
-        del df_res
-        gc.collect()
+    # 清洗无效行
+    df_res = df_res.dropna(subset=['close']).reset_index()
+    
+    # 排序
+    df_res.sort_values(['code', 'date'], inplace=True)
+    
+    # 计算周/月线指标 (简单版，只算均线)
+    grouped = df_res.groupby('code')['close']
+    df_res['ma5'] = grouped.rolling(5).mean().reset_index(0, drop=True)
+    df_res['ma10'] = grouped.rolling(10).mean().reset_index(0, drop=True)
+    df_res['ma20'] = grouped.rolling(20).mean().reset_index(0, drop=True)
+    
+    # 格式化与压缩
+    df_res['date'] = df_res['date'].dt.strftime('%Y-%m-%d')
+    
+    float_cols = df_res.select_dtypes(include=['float64']).columns
+    for c in float_cols:
+        df_res[c] = df_res[c].round(3).astype('float32')
 
-    # 执行重采样
-    resample_and_save(df_total, 'W-FRI', 'stock_weekly')
-    resample_and_save(df_total, 'ME', 'stock_monthly')
+    out_path = f"{OUTPUT_ENGINE}/{filename}"
+    df_res.to_parquet(out_path, index=False, compression='zstd')
+    print(f"      ✅ 已保存: {len(df_res)} 行")
 
-    # === 7. 保存日线数据 ===
-    # A. 更新 Cache (全年)
+def main():
+    print("🚀 开始全量合并与周期生成 (内存优化版)...")
+    
     current_year = datetime.datetime.now().year
-    df_cache = df_total[df_total['date'].dt.year == current_year].copy()
-    df_cache['date'] = df_cache['date'].dt.strftime('%Y-%m-%d')
     
-    print(f"💾 保存 Cache: stock_current_year.parquet")
-    df_cache.to_parquet(f"{CACHE_DIR}/stock_current_year.parquet", index=False, compression='zstd')
-    del df_cache
-    gc.collect()
+    # 1. 加载历史数据 (Release + Cache)
+    history_files = glob.glob(f"{CACHE_DIR}/*.parquet")
+    if history_files:
+        print(f"📦 加载历史文件: {len(history_files)} 个")
+        df_history = pd.concat([pd.read_parquet(f) for f in history_files], ignore_index=True)
+    else:
+        print("⚠️ 未找到历史数据，将进行全量初始化")
+        df_history = pd.DataFrame()
 
-    # B. 更新 OSS (同上，也就是 Cache 文件)
-    # 因为 OSS 也是按年存的，直接复制即可，或者这里再存一份
-    oss_path = f"{OUTPUT_DIR}/stock_daily/stock_{current_year}.parquet"
-    print(f"💾 保存 OSS: {oss_path}")
-    # 这里偷懒直接读刚才存的 cache 文件复制过去，或者用 df_cache (如果没删)
-    # 由于刚才 del 了，这里重新筛选一下或者拷贝文件
-    # 既然 df_total 还在，再切一次也很快
-    df_oss = df_total[df_total['date'].dt.year == current_year].copy()
-    df_oss['date'] = df_oss['date'].dt.strftime('%Y-%m-%d')
-    df_oss.to_parquet(oss_path, index=False, compression='zstd')
+    # 2. 加载今日增量
+    k_files = glob.glob(f"{KLINE_DIR}/**/*.parquet", recursive=True)
+    f_files = glob.glob(f"{FLOW_DIR}/**/*.parquet", recursive=True)
+    print(f"🔥 加载今日增量: {len(k_files)} 个 K线文件")
+    
+    f_map = {os.path.basename(f): f for f in f_files}
+    dfs_new = []
+    
+    # 【修复点】这里使用了 tqdm，之前报错就是因为没 import
+    for k_f in tqdm(k_files, desc="Reading New"):
+        try:
+            df_k = pd.read_parquet(k_f)
+            if df_k.empty: continue
+            
+            # 统一转 datetime 方便 merge
+            df_k['date'] = pd.to_datetime(df_k['date'])
+            
+            fname = os.path.basename(k_f)
+            if fname in f_map:
+                df_f = pd.read_parquet(f_map[fname])
+                if not df_f.empty:
+                    df_f['date'] = pd.to_datetime(df_f['date'])
+                    df_k = pd.merge(df_k, df_f, on=['date', 'code'], how='left')
+            
+            dfs_new.append(df_k)
+        except: pass
+        
+    if dfs_new:
+        df_new = pd.concat(dfs_new, ignore_index=True)
+    else:
+        df_new = pd.DataFrame()
 
-    print("✅ 全部处理完成！")
+    # 3. 合并全量
+    if df_history.empty and df_new.empty:
+        print("❌ 无数据处理")
+        return
+
+    # 统一格式
+    if not df_history.empty: df_history['date'] = pd.to_datetime(df_history['date'])
+    # df_new 已经是 datetime
+
+    print("🔄 合并历史与新增...")
+    df_total = pd.concat([df_history, df_new], ignore_index=True)
+    
+    # 去重 (防止重复运行)
+    df_total.drop_duplicates(subset=['code', 'date'], keep='last', inplace=True)
+    df_total.sort_values(['code', 'date'], inplace=True)
+    
+    # 4. 计算全量指标
+    print("🧮 计算技术指标 (耗时操作)...")
+    # 使用 groupby apply 进行并行计算
+    df_total = df_total.groupby('code', group_keys=False).apply(calculate_indicators)
+    
+    # 5. 生成周线/月线
+    # (此时 date 还是 datetime 类型，正好用于 resample)
+    print("📅 生成多周期数据...")
+    process_resample(df_total, 'W-FRI', 'stock_weekly.parquet')
+    process_resample(df_total, 'ME', 'stock_monthly.parquet')
+
+    # 6. 数据类型压缩 (准备保存)
+    print("💾 数据类型优化...")
+    float_cols = df_total.select_dtypes(include=['float64']).columns
+    for c in float_cols:
+        df_total[c] = df_total[c].round(3).astype('float32')
+        
+    # 还原日期为字符串
+    df_total['date'] = df_total['date'].dt.strftime('%Y-%m-%d')
+
+    # 7. 切分输出
+    # A. 保存 Cache (供明天用，仅保留当年的热数据)
+    df_hot = df_total[df_total['date'] >= f"{current_year}-01-01"].copy()
+    cache_path = f"{CACHE_DIR}/stock_current_year.parquet"
+    print(f"📦 更新 Cache 文件: {cache_path} ({len(df_hot)} 行)")
+    df_hot.to_parquet(cache_path, index=False, compression='zstd')
+
+    # B. 保存 OSS (仅保存当年的文件到 stock_daily 目录)
+    oss_path = f"{OUTPUT_DAILY}/stock_{current_year}.parquet"
+    print(f"☁️ 生成 OSS 文件: {oss_path}")
+    df_hot.to_parquet(oss_path, index=False, compression='zstd')
+
+    print("✅ 处理完成！")
 
 if __name__ == "__main__":
     main()
