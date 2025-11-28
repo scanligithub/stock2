@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   # ====================================================
-  # Job 1: 准备任务分片
+  # Job 1: 准备任务分片 (Prepare)
   # ====================================================
   prepare:
     runs-on: ubuntu-latest
@@ -32,6 +32,9 @@ jobs:
       
       - name: Generate Task Slices
         run: python scripts/prepare_tasks.py
+        env:
+          # 如需全量跑，保持默认或设为 false；测试设为 true
+          TEST_MODE: "false"
         
       - uses: actions/upload-artifact@v4
         with:
@@ -44,7 +47,7 @@ jobs:
           path: meta_data/
 
   # ====================================================
-  # Job 2: 并行下载 K线
+  # Job 2: 并行下载 K线 (Matrix 0-19)
   # ====================================================
   download-kline:
     needs: prepare
@@ -81,7 +84,7 @@ jobs:
           path: temp_kline/
 
   # ====================================================
-  # Job 3: 并行下载 资金流向
+  # Job 3: 并行下载 资金流向 (Matrix 0-19)
   # ====================================================
   download-fundflow:
     needs: prepare
@@ -118,7 +121,7 @@ jobs:
           path: temp_fundflow/
 
   # ====================================================
-  # Job 4: 下载/更新 板块历史数据
+  # Job 4: 下载/更新 板块历史数据 (Cloudflare Proxy)
   # ====================================================
   process-sector:
     runs-on: ubuntu-latest
@@ -151,15 +154,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # 【核心优化】开启 8GB Swap 空间，防止 Pandas 合并数据时 OOM
-      - name: Set up Swap Space
-        run: |
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          free -h
       
       # 1. 下载所有中间产物
       - uses: actions/download-artifact@v4
@@ -178,21 +172,22 @@ jobs:
           cp -r all_artifacts/sector_data/* final_output/engine/ 2>/dev/null || true
           cp all_artifacts/meta-data/stock_list.json final_output/meta/ 2>/dev/null || true
 
-      # 2. 从 Releases 下载历史冷数据
+      # 2. 【归档策略】从 Releases 下载 2024年及以前的历史冷数据
       - name: Download Historical Archive (Cold Data)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release download archive-init --pattern "*.parquet" --dir cache_data || echo "⚠️ No historical archive found in Releases."
 
-      # 3. 从 Cache 恢复当年热数据
+      # 3. 【归档策略】从 Cache 恢复 2025年(当年)的热数据
       - name: Restore Current Year Cache (Hot Data)
         uses: actions/cache/restore@v4
         with:
-          path: cache_data/stock_current_year.parquet
-          key: stock-hot-data-${{ github.run_id }}
+          path: cache_data/stock_buffer.parquet
+          # 每天生成唯一的 cache key，回退匹配最近的
+          key: stock-buffer-${{ github.run_id }}
           restore-keys: |
-            stock-hot-data-
+            stock-buffer-
 
       - uses: actions/setup-python@v5
         with:
@@ -202,16 +197,16 @@ jobs:
       - name: Install dependencies
         run: pip install --pre -r requirements.txt
       
-      # 4. 执行核心脚本 (高内存消耗步骤)
+      # 4. 执行核心脚本
       - name: Merge Wide Table & Calc Indicators
         run: python scripts/merge_data.py
 
-      # 5. 保存 Cache
+      # 5. 【归档策略】保存 Cache (供明天增量更新用)
       - name: Save Current Year Cache
         uses: actions/cache/save@v4
         with:
-          path: cache_data/stock_current_year.parquet
-          key: stock-hot-data-${{ github.run_id }}
+          path: cache_data/stock_buffer.parquet
+          key: stock-buffer-${{ github.run_id }}
 
       # 6. 执行质检
       - name: Run Data Quality Check
@@ -228,7 +223,7 @@ jobs:
           name: quality-report
           path: final_output/report/
 
-      # 9. 备份 OSS Ready Data 到 Artifacts
+      # 9. 备份 OSS Ready Data 到 Artifacts (方便下载检查)
       - name: Upload OSS Assets to Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -246,12 +241,13 @@ jobs:
       # 11. 上传结果到 Aliyun OSS
       - name: Upload to OSS
         run: |
+          # 上传元数据
           ossutil cp -f final_output/meta/stock_list.json oss://${{ secrets.OSS_BUCKET }}/meta/stock_list.json
           
-          # 上传个股数据目录 (包含 stock_20xx.parquet)
+          # 上传个股宽表 (递归上传 stock_daily 目录, 里面包含 stock_20xx.parquet)
           ossutil cp -r -f final_output/engine/stock_daily/ oss://${{ secrets.OSS_BUCKET }}/engine/stock_daily/
           
-          # 上传周/月线数据
+          # 上传周线/月线数据
           ossutil cp -f final_output/engine/stock_weekly.parquet oss://${{ secrets.OSS_BUCKET }}/engine/stock_weekly.parquet || true
           ossutil cp -f final_output/engine/stock_monthly.parquet oss://${{ secrets.OSS_BUCKET }}/engine/stock_monthly.parquet || true
           
